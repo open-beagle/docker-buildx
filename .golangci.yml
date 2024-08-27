@@ -25,17 +25,30 @@ linters:
   disable-all: true
 
 linters-settings:
+  govet:
+    enable:
+      - nilness
+      - unusedwrite
+  # enable-all: true
+  # disable:
+  #   - fieldalignment
+  #   - shadow
   depguard:
     rules:
       main:
         deny:
-          # The io/ioutil package has been deprecated.
-          # https://go.dev/doc/go1.16#ioutil
+          - pkg: "github.com/containerd/containerd/errdefs"
+            desc: The containerd errdefs package was migrated to a separate module. Use github.com/containerd/errdefs instead.
+          - pkg: "github.com/containerd/containerd/log"
+            desc: The containerd log package was migrated to a separate module. Use github.com/containerd/log instead.
+          - pkg: "github.com/containerd/containerd/platforms"
+            desc: The containerd platforms package was migrated to a separate module. Use github.com/containerd/platforms instead.
           - pkg: "io/ioutil"
             desc: The io/ioutil package has been deprecated.
   forbidigo:
     forbid:
       - '^fmt\.Errorf(# use errors\.Errorf instead)?$'
+      - '^platforms\.DefaultString(# use platforms\.Format(platforms\.DefaultSpec()) instead\.)?$'
   gosec:
     excludes:
       - G204  # Audit use of command execution
