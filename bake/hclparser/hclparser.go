@@ -25,11 +25,17 @@ type Opt struct {
 }
 
 type variable struct {
-	Name        string         `json:"-" hcl:"name,label"`
-	Default     *hcl.Attribute `json:"default,omitempty" hcl:"default,optional"`
-	Description string         `json:"description,omitempty" hcl:"description,optional"`
-	Body        hcl.Body       `json:"-" hcl:",body"`
-	Remain      hcl.Body       `json:"-" hcl:",remain"`
+	Name        string                `json:"-" hcl:"name,label"`
+	Default     *hcl.Attribute        `json:"default,omitempty" hcl:"default,optional"`
+	Description string                `json:"description,omitempty" hcl:"description,optional"`
+	Validations []*variableValidation `json:"validation,omitempty" hcl:"validation,block"`
+	Body        hcl.Body              `json:"-" hcl:",body"`
+	Remain      hcl.Body              `json:"-" hcl:",remain"`
+}
+
+type variableValidation struct {
+	Condition    hcl.Expression `json:"condition" hcl:"condition"`
+	ErrorMessage hcl.Expression `json:"error_message" hcl:"error_message"`
 }
 
 type functionDef struct {
@@ -75,7 +81,12 @@ type WithGetName interface {
 	GetName(ectx *hcl.EvalContext, block *hcl.Block, loadDeps func(hcl.Expression) hcl.Diagnostics) (string, error)
 }
 
-var errUndefined = errors.New("undefined")
+// errUndefined is returned when a variable or function is not defined.
+type errUndefined struct{}
+
+func (errUndefined) Error() string {
+	return "undefined"
+}
 
 func (p *parser) loadDeps(ectx *hcl.EvalContext, exp hcl.Expression, exclude map[string]struct{}, allowMissing bool) hcl.Diagnostics {
 	fns, hcldiags := funcCalls(exp)
@@ -85,7 +96,7 @@ func (p *parser) loadDeps(ectx *hcl.EvalContext, exp hcl.Expression, exclude map
 
 	for _, fn := range fns {
 		if err := p.resolveFunction(ectx, fn); err != nil {
-			if allowMissing && errors.Is(err, errUndefined) {
+			if allowMissing && errors.Is(err, errUndefined{}) {
 				continue
 			}
 			return wrapErrorDiagnostic("Invalid expression", err, exp.Range().Ptr(), exp.Range().Ptr())
@@ -139,7 +150,7 @@ func (p *parser) loadDeps(ectx *hcl.EvalContext, exp hcl.Expression, exclude map
 			}
 			for _, block := range blocks {
 				if err := p.resolveBlock(block, target); err != nil {
-					if allowMissing && errors.Is(err, errUndefined) {
+					if allowMissing && errors.Is(err, errUndefined{}) {
 						continue
 					}
 					return wrapErrorDiagnostic("Invalid expression", err, exp.Range().Ptr(), exp.Range().Ptr())
@@ -147,7 +158,7 @@ func (p *parser) loadDeps(ectx *hcl.EvalContext, exp hcl.Expression, exclude map
 			}
 		} else {
 			if err := p.resolveValue(ectx, v.RootName()); err != nil {
-				if allowMissing && errors.Is(err, errUndefined) {
+				if allowMissing && errors.Is(err, errUndefined{}) {
 					continue
 				}
 				return wrapErrorDiagnostic("Invalid expression", err, exp.Range().Ptr(), exp.Range().Ptr())
@@ -169,7 +180,7 @@ func (p *parser) resolveFunction(ectx *hcl.EvalContext, name string) error {
 	}
 	f, ok := p.funcs[name]
 	if !ok {
-		return errors.Wrapf(errUndefined, "function %q does not exist", name)
+		return errors.Wrapf(errUndefined{}, "function %q does not exist", name)
 	}
 	if _, ok := p.progressF[key(ectx, name)]; ok {
 		return errors.Errorf("function cycle not allowed for %s", name)
@@ -259,7 +270,7 @@ func (p *parser) resolveValue(ectx *hcl.EvalContext, name string) (err error) {
 	if _, builtin := p.opt.Vars[name]; !ok && !builtin {
 		vr, ok := p.vars[name]
 		if !ok {
-			return errors.Wrapf(errUndefined, "variable %q does not exist", name)
+			return errors.Wrapf(errUndefined{}, "variable %q does not exist", name)
 		}
 		def = vr.Default
 		ectx = p.ectx
@@ -536,6 +547,33 @@ func (p *parser) resolveBlockNames(block *hcl.Block) ([]string, error) {
 	return names, nil
 }
 
+func (p *parser) validateVariables(vars map[string]*variable, ectx *hcl.EvalContext) hcl.Diagnostics {
+	var diags hcl.Diagnostics
+	for _, v := range vars {
+		for _, validation := range v.Validations {
+			condition, condDiags := validation.Condition.Value(ectx)
+			if condDiags.HasErrors() {
+				diags = append(diags, condDiags...)
+				continue
+			}
+			if !condition.True() {
+				message, msgDiags := validation.ErrorMessage.Value(ectx)
+				if msgDiags.HasErrors() {
+					diags = append(diags, msgDiags...)
+					continue
+				}
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Validation failed",
+					Detail:   message.AsString(),
+					Subject:  validation.Condition.Range().Ptr(),
+				})
+			}
+		}
+	}
+	return diags
+}
+
 type Variable struct {
 	Name        string
 	Description string
@@ -680,6 +718,9 @@ func Parse(b hcl.Body, opt Opt, val interface{}) (*ParseMeta, hcl.Diagnostics) {
 			v.Value = &s
 		}
 		vars = append(vars, v)
+	}
+	if diags := p.validateVariables(p.vars, p.ectx); diags.HasErrors() {
+		return nil, diags
 	}
 
 	for k := range p.funcs {

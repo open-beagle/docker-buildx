@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ import (
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/session/auth/authprovider"
+	"github.com/moby/buildkit/util/entitlements"
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/go-csvvalue"
 	"github.com/zclconf/go-cty/cty"
@@ -191,7 +193,7 @@ func ListTargets(files []File) ([]string, error) {
 	return dedupSlice(targets), nil
 }
 
-func ReadTargets(ctx context.Context, files []File, targets, overrides []string, defaults map[string]string) (map[string]*Target, map[string]*Group, error) {
+func ReadTargets(ctx context.Context, files []File, targets, overrides []string, defaults map[string]string, ent *EntitlementConf) (map[string]*Target, map[string]*Group, error) {
 	c, _, err := ParseFiles(files, defaults)
 	if err != nil {
 		return nil, nil, err
@@ -210,7 +212,7 @@ func ReadTargets(ctx context.Context, files []File, targets, overrides []string,
 	for _, target := range targets {
 		ts, gs := c.ResolveGroup(target)
 		for _, tname := range ts {
-			t, err := c.ResolveTarget(tname, o)
+			t, err := c.ResolveTarget(tname, o, ent)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -242,7 +244,7 @@ func ReadTargets(ctx context.Context, files []File, targets, overrides []string,
 	}
 
 	for name, t := range m {
-		if err := c.loadLinks(name, t, m, o, nil); err != nil {
+		if err := c.loadLinks(name, t, m, o, nil, ent); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -474,12 +476,12 @@ func (c Config) expandTargets(pattern string) ([]string, error) {
 	return names, nil
 }
 
-func (c Config) loadLinks(name string, t *Target, m map[string]*Target, o map[string]map[string]Override, visited []string) error {
+func (c Config) loadLinks(name string, t *Target, m map[string]*Target, o map[string]map[string]Override, visited []string, ent *EntitlementConf) error {
 	visited = append(visited, name)
 	for _, v := range t.Contexts {
 		if strings.HasPrefix(v, "target:") {
 			target := strings.TrimPrefix(v, "target:")
-			if target == t.Name {
+			if target == name {
 				return errors.Errorf("target %s cannot link to itself", target)
 			}
 			for _, v := range visited {
@@ -490,7 +492,7 @@ func (c Config) loadLinks(name string, t *Target, m map[string]*Target, o map[st
 			t2, ok := m[target]
 			if !ok {
 				var err error
-				t2, err = c.ResolveTarget(target, o)
+				t2, err = c.ResolveTarget(target, o, ent)
 				if err != nil {
 					return err
 				}
@@ -498,9 +500,17 @@ func (c Config) loadLinks(name string, t *Target, m map[string]*Target, o map[st
 				t2.linked = true
 				m[target] = t2
 			}
-			if err := c.loadLinks(target, t2, m, o, visited); err != nil {
+			if err := c.loadLinks(target, t2, m, o, visited, ent); err != nil {
 				return err
 			}
+
+			// entitlements are inherited from linked targets
+			for _, ent := range t2.Entitlements {
+				if !slices.Contains(t.Entitlements, ent) {
+					t.Entitlements = append(t.Entitlements, ent)
+				}
+			}
+
 			if len(t.Platforms) > 1 && len(t2.Platforms) > 1 {
 				if !sliceEqual(t.Platforms, t2.Platforms) {
 					return errors.Errorf("target %s can't be used by %s because it is defined for different platforms %v and %v", target, name, t2.Platforms, t.Platforms)
@@ -542,7 +552,7 @@ func (c Config) newOverrides(v []string) (map[string]map[string]Override, error)
 			o := t[kk[1]]
 
 			switch keys[1] {
-			case "output", "cache-to", "cache-from", "tags", "platform", "secrets", "ssh", "attest":
+			case "output", "cache-to", "cache-from", "tags", "platform", "secrets", "ssh", "attest", "entitlements", "network":
 				if len(parts) == 2 {
 					o.ArrValue = append(o.ArrValue, parts[1])
 				}
@@ -617,8 +627,8 @@ func (c Config) group(name string, visited map[string]visit) ([]string, []string
 	return targets, groups
 }
 
-func (c Config) ResolveTarget(name string, overrides map[string]map[string]Override) (*Target, error) {
-	t, err := c.target(name, map[string]*Target{}, overrides)
+func (c Config) ResolveTarget(name string, overrides map[string]map[string]Override, ent *EntitlementConf) (*Target, error) {
+	t, err := c.target(name, map[string]*Target{}, overrides, ent)
 	if err != nil {
 		return nil, err
 	}
@@ -634,7 +644,7 @@ func (c Config) ResolveTarget(name string, overrides map[string]map[string]Overr
 	return t, nil
 }
 
-func (c Config) target(name string, visited map[string]*Target, overrides map[string]map[string]Override) (*Target, error) {
+func (c Config) target(name string, visited map[string]*Target, overrides map[string]map[string]Override, ent *EntitlementConf) (*Target, error) {
 	if t, ok := visited[name]; ok {
 		return t, nil
 	}
@@ -651,7 +661,7 @@ func (c Config) target(name string, visited map[string]*Target, overrides map[st
 	}
 	tt := &Target{}
 	for _, name := range t.Inherits {
-		t, err := c.target(name, visited, overrides)
+		t, err := c.target(name, visited, overrides, ent)
 		if err != nil {
 			return nil, err
 		}
@@ -663,7 +673,7 @@ func (c Config) target(name string, visited map[string]*Target, overrides map[st
 	m.Merge(tt)
 	m.Merge(t)
 	tt = m
-	if err := tt.AddOverrides(overrides[name]); err != nil {
+	if err := tt.AddOverrides(overrides[name], ent); err != nil {
 		return nil, err
 	}
 	tt.normalize()
@@ -703,21 +713,24 @@ type Target struct {
 	Outputs          []string           `json:"output,omitempty" hcl:"output,optional" cty:"output"`
 	Pull             *bool              `json:"pull,omitempty" hcl:"pull,optional" cty:"pull"`
 	NoCache          *bool              `json:"no-cache,omitempty" hcl:"no-cache,optional" cty:"no-cache"`
-	NetworkMode      *string            `json:"-" hcl:"-" cty:"-"`
+	NetworkMode      *string            `json:"network,omitempty" hcl:"network,optional" cty:"network"`
 	NoCacheFilter    []string           `json:"no-cache-filter,omitempty" hcl:"no-cache-filter,optional" cty:"no-cache-filter"`
 	ShmSize          *string            `json:"shm-size,omitempty" hcl:"shm-size,optional"`
 	Ulimits          []string           `json:"ulimits,omitempty" hcl:"ulimits,optional"`
 	Call             *string            `json:"call,omitempty" hcl:"call,optional" cty:"call"`
+	Entitlements     []string           `json:"entitlements,omitempty" hcl:"entitlements,optional" cty:"entitlements"`
 	// IMPORTANT: if you add more fields here, do not forget to update newOverrides/AddOverrides and docs/bake-reference.md.
 
 	// linked is a private field to mark a target used as a linked one
 	linked bool
 }
 
-var _ hclparser.WithEvalContexts = &Target{}
-var _ hclparser.WithGetName = &Target{}
-var _ hclparser.WithEvalContexts = &Group{}
-var _ hclparser.WithGetName = &Group{}
+var (
+	_ hclparser.WithEvalContexts = &Target{}
+	_ hclparser.WithGetName      = &Target{}
+	_ hclparser.WithEvalContexts = &Group{}
+	_ hclparser.WithGetName      = &Group{}
+)
 
 func (t *Target) normalize() {
 	t.Annotations = removeDupes(t.Annotations)
@@ -731,6 +744,12 @@ func (t *Target) normalize() {
 	t.Outputs = removeDupes(t.Outputs)
 	t.NoCacheFilter = removeDupes(t.NoCacheFilter)
 	t.Ulimits = removeDupes(t.Ulimits)
+
+	if t.NetworkMode != nil && *t.NetworkMode == "host" {
+		t.Entitlements = append(t.Entitlements, "network.host")
+	}
+
+	t.Entitlements = removeDupes(t.Entitlements)
 
 	for k, v := range t.Contexts {
 		if v == "" {
@@ -831,10 +850,13 @@ func (t *Target) Merge(t2 *Target) {
 	if t2.Description != "" {
 		t.Description = t2.Description
 	}
+	if t2.Entitlements != nil { // merge
+		t.Entitlements = append(t.Entitlements, t2.Entitlements...)
+	}
 	t.Inherits = append(t.Inherits, t2.Inherits...)
 }
 
-func (t *Target) AddOverrides(overrides map[string]Override) error {
+func (t *Target) AddOverrides(overrides map[string]Override, ent *EntitlementConf) error {
 	for key, o := range overrides {
 		value := o.Value
 		keys := strings.SplitN(key, ".", 2)
@@ -845,7 +867,7 @@ func (t *Target) AddOverrides(overrides map[string]Override) error {
 			t.Dockerfile = &value
 		case "args":
 			if len(keys) != 2 {
-				return errors.Errorf("args require name")
+				return errors.Errorf("invalid format for args, expecting args.<name>=<value>")
 			}
 			if t.Args == nil {
 				t.Args = map[string]*string{}
@@ -853,7 +875,7 @@ func (t *Target) AddOverrides(overrides map[string]Override) error {
 			t.Args[keys[1]] = &value
 		case "contexts":
 			if len(keys) != 2 {
-				return errors.Errorf("contexts require name")
+				return errors.Errorf("invalid format for contexts, expecting contexts.<name>=<value>")
 			}
 			if t.Contexts == nil {
 				t.Contexts = map[string]string{}
@@ -861,7 +883,7 @@ func (t *Target) AddOverrides(overrides map[string]Override) error {
 			t.Contexts[keys[1]] = value
 		case "labels":
 			if len(keys) != 2 {
-				return errors.Errorf("labels require name")
+				return errors.Errorf("invalid format for labels, expecting labels.<name>=<value>")
 			}
 			if t.Labels == nil {
 				t.Labels = map[string]*string{}
@@ -871,20 +893,76 @@ func (t *Target) AddOverrides(overrides map[string]Override) error {
 			t.Tags = o.ArrValue
 		case "cache-from":
 			t.CacheFrom = o.ArrValue
+			cacheFrom, err := buildflags.ParseCacheEntry(o.ArrValue)
+			if err != nil {
+				return err
+			}
+			for _, c := range cacheFrom {
+				if c.Type == "local" {
+					if v, ok := c.Attrs["src"]; ok {
+						ent.FSRead = append(ent.FSRead, v)
+					}
+				}
+			}
 		case "cache-to":
 			t.CacheTo = o.ArrValue
+			cacheTo, err := buildflags.ParseCacheEntry(o.ArrValue)
+			if err != nil {
+				return err
+			}
+			for _, c := range cacheTo {
+				if c.Type == "local" {
+					if v, ok := c.Attrs["dest"]; ok {
+						ent.FSWrite = append(ent.FSWrite, v)
+					}
+				}
+			}
 		case "target":
 			t.Target = &value
 		case "call":
 			t.Call = &value
 		case "secrets":
 			t.Secrets = o.ArrValue
+			secrets, err := buildflags.ParseSecretSpecs(o.ArrValue)
+			if err != nil {
+				return errors.Wrap(err, "invalid value for outputs")
+			}
+			for _, s := range secrets {
+				if s.FilePath != "" {
+					ent.FSRead = append(ent.FSRead, s.FilePath)
+				}
+			}
 		case "ssh":
 			t.SSH = o.ArrValue
+			ssh, err := buildflags.ParseSSHSpecs(o.ArrValue)
+			if err != nil {
+				return errors.Wrap(err, "invalid value for outputs")
+			}
+			for _, s := range ssh {
+				ent.FSRead = append(ent.FSRead, s.Paths...)
+			}
 		case "platform":
 			t.Platforms = o.ArrValue
 		case "output":
 			t.Outputs = o.ArrValue
+			outputs, err := buildflags.ParseExports(o.ArrValue)
+			if err != nil {
+				return errors.Wrap(err, "invalid value for outputs")
+			}
+			for _, o := range outputs {
+				if o.Destination != "" {
+					ent.FSWrite = append(ent.FSWrite, o.Destination)
+				}
+			}
+		case "entitlements":
+			t.Entitlements = append(t.Entitlements, o.ArrValue...)
+			for _, v := range o.ArrValue {
+				if v == string(EntitlementKeyNetworkHost) {
+					ent.NetworkHost = true
+				} else if v == string(EntitlementKeySecurityInsecure) {
+					ent.SecurityInsecure = true
+				}
+			}
 		case "annotations":
 			t.Annotations = append(t.Annotations, o.ArrValue...)
 		case "attest":
@@ -901,6 +979,8 @@ func (t *Target) AddOverrides(overrides map[string]Override) error {
 			t.ShmSize = &value
 		case "ulimits":
 			t.Ulimits = o.ArrValue
+		case "network":
+			t.NetworkMode = &value
 		case "pull":
 			pull, err := strconv.ParseBool(value)
 			if err != nil {
@@ -1091,62 +1171,34 @@ func updateContext(t *build.Inputs, inp *Input) {
 	t.ContextState = &st
 }
 
-// validateContextsEntitlements is a basic check to ensure contexts do not
-// escape local directories when loaded from remote sources. This is to be
-// replaced with proper entitlements support in the future.
-func validateContextsEntitlements(t build.Inputs, inp *Input) error {
-	if inp == nil || inp.State == nil {
-		return nil
-	}
-	if v, ok := os.LookupEnv("BAKE_ALLOW_REMOTE_FS_ACCESS"); ok {
-		if vv, _ := strconv.ParseBool(v); vv {
-			return nil
-		}
-	}
+func collectLocalPaths(t build.Inputs) []string {
+	var out []string
 	if t.ContextState == nil {
-		if err := checkPath(t.ContextPath); err != nil {
-			return err
+		if v, ok := isLocalPath(t.ContextPath); ok {
+			out = append(out, v)
 		}
+		if v, ok := isLocalPath(t.DockerfilePath); ok {
+			out = append(out, v)
+		}
+	} else if strings.HasPrefix(t.ContextPath, "cwd://") {
+		out = append(out, strings.TrimPrefix(t.ContextPath, "cwd://"))
 	}
 	for _, v := range t.NamedContexts {
 		if v.State != nil {
 			continue
 		}
-		if err := checkPath(v.Path); err != nil {
-			return err
+		if v, ok := isLocalPath(v.Path); ok {
+			out = append(out, v)
 		}
 	}
-	return nil
+	return out
 }
 
-func checkPath(p string) error {
+func isLocalPath(p string) (string, bool) {
 	if build.IsRemoteURL(p) || strings.HasPrefix(p, "target:") || strings.HasPrefix(p, "docker-image:") {
-		return nil
+		return "", false
 	}
-	p, err := filepath.EvalSymlinks(p)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	p, err = filepath.Abs(p)
-	if err != nil {
-		return err
-	}
-	wd, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-	rel, err := filepath.Rel(wd, p)
-	if err != nil {
-		return err
-	}
-	parts := strings.Split(rel, string(os.PathSeparator))
-	if parts[0] == ".." {
-		return errors.Errorf("path %s is outside of the working directory, please set BAKE_ALLOW_REMOTE_FS_ACCESS=1", p)
-	}
-	return nil
+	return strings.TrimPrefix(p, "cwd://"), true
 }
 
 func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
@@ -1186,9 +1238,6 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 		// it's not outside the working directory and then resolve it to an
 		// absolute path.
 		bi.DockerfilePath = path.Clean(strings.TrimPrefix(bi.DockerfilePath, "cwd://"))
-		if err := checkPath(bi.DockerfilePath); err != nil {
-			return nil, err
-		}
 		var err error
 		bi.DockerfilePath, err = filepath.Abs(bi.DockerfilePath)
 		if err != nil {
@@ -1223,10 +1272,6 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 		if strings.HasPrefix(v.Path, "cwd://") {
 			bi.NamedContexts[k] = build.NamedContext{Path: path.Clean(strings.TrimPrefix(v.Path, "cwd://"))}
 		}
-	}
-
-	if err := validateContextsEntitlements(bi, inp); err != nil {
-		return nil, err
 	}
 
 	t.Context = &bi.ContextPath
@@ -1289,6 +1334,8 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	if err != nil {
 		return nil, err
 	}
+	bo.SecretSpecs = secrets
+
 	secretAttachment, err := controllerapi.CreateSecrets(secrets)
 	if err != nil {
 		return nil, err
@@ -1302,6 +1349,8 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	if len(sshSpecs) == 0 && (buildflags.IsGitSSH(bi.ContextPath) || (inp != nil && buildflags.IsGitSSH(inp.URL))) {
 		sshSpecs = append(sshSpecs, &controllerapi.SSH{ID: "default"})
 	}
+	bo.SSHSpecs = sshSpecs
+
 	sshAttachment, err := controllerapi.CreateSSH(sshSpecs)
 	if err != nil {
 		return nil, err
@@ -1313,7 +1362,7 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	}
 
 	if t.Call != nil {
-		bo.PrintFunc = &build.PrintFunc{
+		bo.CallFunc = &build.CallFunc{
 			Name: *t.Call,
 		}
 	}
@@ -1334,7 +1383,8 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	if err != nil {
 		return nil, err
 	}
-	bo.Exports, err = controllerapi.CreateExports(outputs)
+
+	bo.Exports, bo.ExportsLocalPathsTemporary, err = controllerapi.CreateExports(outputs)
 	if err != nil {
 		return nil, err
 	}
@@ -1367,6 +1417,10 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 		}
 	}
 	bo.Ulimits = ulimits
+
+	for _, ent := range t.Entitlements {
+		bo.Allow = append(bo.Allow, entitlements.Entitlement(ent))
+	}
 
 	return bo, nil
 }

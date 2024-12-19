@@ -1,5 +1,14 @@
 name: docs-release
 
+# Default to 'contents: read', which grants actions to read commits.
+#
+# If any permission is set, any permission not included in the list is
+# implicitly set to "none".
+#
+# see https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#permissions
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:
@@ -14,6 +23,9 @@ jobs:
   open-pr:
     runs-on: ubuntu-24.04
     if: ${{ (github.event.release.prerelease != true || github.event.inputs.tag != '') && github.repository == 'docker/buildx' }}
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       -
         name: Checkout docs repo
@@ -57,7 +69,7 @@ jobs:
           VENDOR_MODULE: github.com/docker/buildx@${{ env.RELEASE_NAME }}
       -
         name: Create PR on docs repo
-        uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c  # v6.1.0
+        uses: peter-evans/create-pull-request@5e914681df9dc83aa4e4905692ca88beb2f9e91f  # v7.0.5
         with:
           token: ${{ secrets.GHPAT_DOCS_DISPATCH }}
           push-to-fork: docker-tools-robot/docker.github.io
