@@ -7,7 +7,7 @@ git remote add upstream git@github.com:docker/buildx.git
 
 git fetch upstream
 
-git merge v0.19.2
+git merge v0.19.3
 ```
 
 ## build
@@ -18,9 +18,9 @@ docker run -it \
 --rm \
 -v $PWD/:/go/src/github.com/docker/buildx \
 -w /go/src/github.com/docker/buildx \
--e VERSION=v0.19.2-beagle \
+-e VERSION=v0.19.3-beagle \
 -e PLATFORM="Beagle Cloud Team 2023-2028" \
-registry.cn-qingdao.aliyuncs.com/wod/golang:1.22-loongnix \
+registry.cn-qingdao.aliyuncs.com/wod/golang:1.23-loongnix \
 bash .beagle/build.sh
 ```
 

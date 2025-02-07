@@ -3,7 +3,7 @@ name: docker
 
 trigger:
   branch:
-    - main
+    - release-v0.19
 
 volumes:
   - name: docker
@@ -36,9 +36,9 @@ steps:
         from_secret: SOCKS5_PROXY
 
   - name: golang
-    image: registry.cn-qingdao.aliyuncs.com/wod/golang:1.22-loongnix
+    image: registry.cn-qingdao.aliyuncs.com/wod/golang:1.23-loongnix
     environment:
-      VERSION: v0.19.2-beagle
+      VERSION: v0.19.3-beagle
       PLATFORM: Beagle Cloud Team 2023-2028
     commands:
       - bash .beagle/build.sh
@@ -52,7 +52,7 @@ steps:
       dockerfile: .beagle/dockerfile
       base: registry.cn-qingdao.aliyuncs.com/wod/alpine:3-amd64
       repo: wod/docker-buildx
-      version: v0.19.2
+      version: v0.19.3
       channel: amd64
       args: 'TARGETOS=linux,TARGETARCH=amd64'
       registry: registry.cn-qingdao.aliyuncs.com
@@ -70,7 +70,7 @@ steps:
       dockerfile: .beagle/dockerfile
       base: registry.cn-qingdao.aliyuncs.com/wod/alpine:3-arm64
       repo: wod/docker-buildx
-      version: v0.19.2
+      version: v0.19.3
       channel: arm64
       args: 'TARGETOS=linux,TARGETARCH=arm64'
       registry: registry.cn-qingdao.aliyuncs.com
@@ -88,7 +88,7 @@ steps:
       dockerfile: .beagle/dockerfile
       base: registry.cn-qingdao.aliyuncs.com/wod/alpine:3-amd64
       repo: wod/docker-buildx
-      version: v0.19.2
+      version: v0.19.3
       channel: loong64
       args: 'TARGETOS=linux,TARGETARCH=loong64'
       registry: registry.cn-qingdao.aliyuncs.com
