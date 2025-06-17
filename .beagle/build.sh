@@ -2,6 +2,8 @@
 
 set -ex
 
+git config --global --add safe.directory $PWD
+
 mkdir -p dist
 
 export GOARCH=amd64
