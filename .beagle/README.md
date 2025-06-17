@@ -1,6 +1,6 @@
 # docker-buildx
 
-https://github.com/docker/buildx
+<https://github.com/docker/buildx>
 
 ```bash
 git remote add upstream git@github.com:docker/buildx.git
@@ -15,13 +15,13 @@ git merge v0.20.1
 ```bash
 # loong64
 docker run -it \
---rm \
--v $PWD/:/go/src/github.com/docker/buildx \
--w /go/src/github.com/docker/buildx \
--e VERSION=v0.20.1-beagle \
--e PLATFORM="Beagle Cloud Team 2023-2028" \
-registry.cn-qingdao.aliyuncs.com/wod/golang:1.23-loongnix \
-bash .beagle/build.sh
+  --rm \
+  -v $PWD/:/go/src/github.com/docker/buildx \
+  -w /go/src/github.com/docker/buildx \
+  -e VERSION=v0.20.1-beagle \
+  -e PLATFORM="Beagle Cloud Team 2023-2028" \
+  registry.cn-qingdao.aliyuncs.com/wod/golang:1.23-alpine \
+  bash .beagle/build.sh
 ```
 
 ## test
@@ -29,31 +29,17 @@ bash .beagle/build.sh
 ```bash
 # amd64
 docker run -it --rm \
--v $PWD/:/go/src/github.com/docker/buildx \
--w /go/src/github.com/docker/buildx \
-registry.cn-qingdao.aliyuncs.com/wod/alpine:3-amd64 \
-sh -c "build/docker-linux-amd64 version"
+  -v $PWD/:/go/src/github.com/docker/buildx \
+  -w /go/src/github.com/docker/buildx \
+  registry.cn-qingdao.aliyuncs.com/wod/alpine:3-amd64 \
+  sh -c "build/docker-linux-amd64 version"
 
 # arm64
 docker run -it --rm \
--v $PWD/:/go/src/github.com/docker/buildx \
--w /go/src/github.com/docker/buildx \
-registry.cn-qingdao.aliyuncs.com/wod/alpine:3-arm64 \
-sh -c "build/docker-linux-arm64 version"
-
-# ppc64le
-docker run -it --rm \
--v $PWD/:/go/src/github.com/docker/buildx \
--w /go/src/github.com/docker/buildx \
-registry.cn-qingdao.aliyuncs.com/wod/alpine:3-ppc64le \
-sh -c "build/docker-linux-ppc64le version"
-
-# mips64le
-docker run -it --rm \
--v $PWD/:/go/src/github.com/docker/buildx \
--w /go/src/github.com/docker/buildx \
-registry.cn-qingdao.aliyuncs.com/wod/alpine:3-mips64le \
-sh -c "build/docker-linux-mips64le version"
+  -v $PWD/:/go/src/github.com/docker/buildx \
+  -w /go/src/github.com/docker/buildx \
+  registry.cn-qingdao.aliyuncs.com/wod/alpine:3-arm64 \
+  sh -c "build/docker-linux-arm64 version"
 ```
 
 ## cache
