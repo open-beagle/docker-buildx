@@ -13,14 +13,14 @@ git merge v0.20.1
 ## build
 
 ```bash
-# loong64
+# cross
 docker run -it \
   --rm \
   -v $PWD/:/go/src/github.com/docker/buildx \
   -w /go/src/github.com/docker/buildx \
   -e VERSION=v0.20.1-beagle \
   -e PLATFORM="Beagle Cloud Team 2023-2028" \
-  registry.cn-qingdao.aliyuncs.com/wod/golang:1.23-alpine \
+  registry.cn-qingdao.aliyuncs.com/wod/golang:1.23-bookworm \
   bash .beagle/build.sh
 ```
 

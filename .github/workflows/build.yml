@@ -32,7 +32,7 @@ jobs:
             -w /go/src/github.com/docker/buildx \
             -e VERSION=${{ env.BUILD_VERSION }}-beagle \
             -e PLATFORM="Beagle Cloud Team 2023-2028" \
-            ghcr.io/${{ github.repository_owner }}/golang:1.23-alpine \
+            ghcr.io/${{ github.repository_owner }}/golang:1.23-bookworm \
             bash -c "bash ./.beagle/build.sh"
 
       - name: Set up Docker Buildx
