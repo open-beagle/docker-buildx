@@ -3,7 +3,10 @@ package commands
 import (
 	"context"
 	"fmt"
+	"io"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -13,12 +16,12 @@ import (
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/opts"
-	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/go-units"
 	"github.com/moby/buildkit/client"
 	gateway "github.com/moby/buildkit/frontend/gateway/client"
 	pb "github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/apicaps"
+	dclient "github.com/moby/moby/client"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
@@ -33,6 +36,7 @@ type pruneOptions struct {
 	minFreeSpace  opts.MemBytes
 	force         bool
 	verbose       bool
+	timeout       time.Duration
 }
 
 const (
@@ -41,9 +45,7 @@ const (
 )
 
 func runPrune(ctx context.Context, dockerCli command.Cli, opts pruneOptions) error {
-	pruneFilters := opts.filter.Value()
-	pruneFilters = command.PruneFilters(dockerCli, pruneFilters)
-
+	pruneFilters := command.PruneFilters(dockerCli, opts.filter.Value())
 	pi, err := toBuildkitPruneInfo(pruneFilters)
 	if err != nil {
 		return err
@@ -67,7 +69,13 @@ func runPrune(ctx context.Context, dockerCli command.Cli, opts pruneOptions) err
 		return err
 	}
 
-	nodes, err := b.LoadNodes(ctx)
+	timeoutCtx, cancel := context.WithCancelCause(ctx)
+	if opts.timeout > 0 {
+		timeoutCtx, _ = context.WithTimeoutCause(timeoutCtx, opts.timeout, errors.WithStack(context.DeadlineExceeded)) //nolint:govet // no need to manually cancel this context as we already rely on parent
+	}
+	defer func() { cancel(errors.WithStack(context.Canceled)) }()
+
+	nodes, err := b.LoadNodes(timeoutCtx)
 	if err != nil {
 		return err
 	}
@@ -169,38 +177,42 @@ func pruneCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 			options.builder = rootOpts.builder
 			return runPrune(cmd.Context(), dockerCli, options)
 		},
-		ValidArgsFunction: completion.Disable,
+		ValidArgsFunction:     completion.Disable,
+		DisableFlagsInUseLine: true,
 	}
 
 	flags := cmd.Flags()
 	flags.BoolVarP(&options.all, "all", "a", false, "Include internal/frontend images")
-	flags.Var(&options.filter, "filter", `Provide filter values (e.g., "until=24h")`)
+	flags.Var(&options.filter, "filter", `Provide filter values`)
 	flags.Var(&options.reservedSpace, "reserved-space", "Amount of disk space always allowed to keep for cache")
 	flags.Var(&options.minFreeSpace, "min-free-space", "Target amount of free disk space after pruning")
 	flags.Var(&options.maxUsedSpace, "max-used-space", "Maximum amount of disk space allowed to keep for cache")
 	flags.BoolVar(&options.verbose, "verbose", false, "Provide a more verbose output")
 	flags.BoolVarP(&options.force, "force", "f", false, "Do not prompt for confirmation")
+	setBuilderStatusTimeoutFlag(flags, &options.timeout)
 
 	flags.Var(&options.reservedSpace, "keep-storage", "Amount of disk space to keep for cache")
-	flags.MarkDeprecated("keep-storage", "keep-storage flag has been changed to max-storage")
+	flags.MarkDeprecated("keep-storage", "keep-storage flag has been changed to reserved-space")
 
 	return cmd
 }
 
-func toBuildkitPruneInfo(f filters.Args) (*client.PruneInfo, error) {
-	var until time.Duration
-	untilValues := f.Get("until")          // canonical
-	unusedForValues := f.Get("unused-for") // deprecated synonym for "until" filter
+// getFilter returns the list of values associated with the key
+func getFilter(f dclient.Filters, key string) []string {
+	return slices.Collect(maps.Keys(f[key]))
+}
 
-	if len(untilValues) > 0 && len(unusedForValues) > 0 {
-		return nil, errors.Errorf("conflicting filters %q and %q", "until", "unused-for")
+func toBuildkitPruneInfo(pruneFilters dclient.Filters) (*client.PruneInfo, error) {
+	var until time.Duration
+	if len(pruneFilters["until"]) > 0 && len(pruneFilters["unused-for"]) > 0 {
+		return nil, errors.New(`conflicting filters "until" and "unused-for"`)
 	}
 	untilKey := "until"
-	if len(unusedForValues) > 0 {
-		untilKey = "unused-for"
+	if len(pruneFilters["unused-for"]) > 0 {
+		untilKey = "unused-for" // deprecated synonym for "until" filter
 	}
-	untilValues = append(untilValues, unusedForValues...)
 
+	untilValues := getFilter(pruneFilters, untilKey)
 	switch len(untilValues) {
 	case 0:
 		// nothing to do
@@ -211,16 +223,16 @@ func toBuildkitPruneInfo(f filters.Args) (*client.PruneInfo, error) {
 			return nil, errors.Wrapf(err, "%q filter expects a duration (e.g., '24h')", untilKey)
 		}
 	default:
-		return nil, errors.Errorf("filters expect only one value")
+		return nil, errors.Errorf("%q filter expects only one value", untilKey)
 	}
 
-	filters := make([]string, 0, f.Len())
-	for _, filterKey := range f.Keys() {
+	filters := make([]string, 0, len(pruneFilters))
+	for filterKey := range pruneFilters {
 		if filterKey == untilKey {
 			continue
 		}
 
-		values := f.Get(filterKey)
+		values := getFilter(pruneFilters, filterKey)
 		switch len(values) {
 		case 0:
 			filters = append(filters, filterKey)
@@ -233,11 +245,63 @@ func toBuildkitPruneInfo(f filters.Args) (*client.PruneInfo, error) {
 				filters = append(filters, filterKey+"=="+values[0])
 			}
 		default:
-			return nil, errors.Errorf("filters expect only one value")
+			return nil, errors.Errorf("%q filter expects only one value", filterKey)
 		}
 	}
 	return &client.PruneInfo{
 		KeepDuration: until,
 		Filter:       []string{strings.Join(filters, ",")},
 	}, nil
+}
+
+func printKV(w io.Writer, k string, v any) {
+	fmt.Fprintf(w, "%s:\t%v\n", k, v)
+}
+
+func printVerbose(tw *tabwriter.Writer, du []*client.UsageInfo) {
+	for _, di := range du {
+		printKV(tw, "ID", di.ID)
+		if len(di.Parents) != 0 {
+			printKV(tw, "Parent", strings.Join(di.Parents, ","))
+		}
+		printKV(tw, "Created at", di.CreatedAt)
+		printKV(tw, "Mutable", di.Mutable)
+		printKV(tw, "Reclaimable", !di.InUse)
+		printKV(tw, "Shared", di.Shared)
+		printKV(tw, "Size", units.HumanSize(float64(di.Size)))
+		if di.Description != "" {
+			printKV(tw, "Description", di.Description)
+		}
+		printKV(tw, "Usage count", di.UsageCount)
+		if di.LastUsedAt != nil {
+			printKV(tw, "Last used", units.HumanDuration(time.Since(*di.LastUsedAt))+" ago")
+		}
+		if di.RecordType != "" {
+			printKV(tw, "Type", di.RecordType)
+		}
+
+		fmt.Fprintf(tw, "\n")
+	}
+
+	tw.Flush()
+}
+
+func printTableHeader(tw *tabwriter.Writer) {
+	fmt.Fprintln(tw, "ID\tRECLAIMABLE\tSIZE\tLAST ACCESSED")
+}
+
+func printTableRow(tw *tabwriter.Writer, di *client.UsageInfo) {
+	id := di.ID
+	if di.Mutable {
+		id += "*"
+	}
+	size := units.HumanSize(float64(di.Size))
+	if di.Shared {
+		size += "*"
+	}
+	lastAccessed := ""
+	if di.LastUsedAt != nil {
+		lastAccessed = units.HumanDuration(time.Since(*di.LastUsedAt)) + " ago"
+	}
+	fmt.Fprintf(tw, "%-40s\t%-5v\t%-10s\t%s\n", id, !di.InUse, size, lastAccessed)
 }

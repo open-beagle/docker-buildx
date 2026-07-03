@@ -73,14 +73,14 @@ func (sm *Manager) Any(ctx context.Context, g Group, f func(context.Context, str
 		}
 
 		timeoutCtx, cancel := context.WithCancelCause(ctx)
-		timeoutCtx, _ = context.WithTimeoutCause(timeoutCtx, 5*time.Second, errors.WithStack(context.DeadlineExceeded))
+		timeoutCtx, _ = context.WithTimeoutCause(timeoutCtx, 5*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet
 		defer func() { cancel(errors.WithStack(context.Canceled)) }()
 		c, err := sm.Get(timeoutCtx, id, false)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		if err := f(ctx, id, c); err != nil {
+		if err := f(c.Context(ctx), id, c); err != nil {
 			lastErr = err
 			continue
 		}

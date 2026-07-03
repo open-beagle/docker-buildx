@@ -8,10 +8,7 @@ import (
 	"sync"
 
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/docker/pkg/ioutils"
-	"github.com/moby/buildkit/cmd/buildkitd/config"
-	"github.com/pelletier/go-toml"
-	"github.com/pkg/errors"
+	"github.com/moby/sys/atomicwriter"
 	fs "github.com/tonistiigi/fsutil/copy"
 )
 
@@ -106,7 +103,7 @@ func (c *Config) MkdirAll(dir string, perm os.FileMode) error {
 // AtomicWriteFile writes data to a file within the config dir atomically
 func (c *Config) AtomicWriteFile(filename string, data []byte, perm os.FileMode) error {
 	f := filepath.Join(c.dir, filename)
-	if err := ioutils.AtomicWriteFile(f, data, perm); err != nil {
+	if err := atomicwriter.WriteFile(f, data, perm); err != nil {
 		return err
 	}
 	if c.chowner == nil {
@@ -138,25 +135,4 @@ func (c *Config) TryNodeIdentifier() (out string) {
 		return string(dt)
 	}
 	return
-}
-
-// LoadConfigTree loads BuildKit config toml tree
-func LoadConfigTree(fp string) (*toml.Tree, error) {
-	f, err := os.Open(fp)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, errors.Wrapf(err, "failed to load config from %s", fp)
-	}
-	defer f.Close()
-	t, err := toml.LoadReader(f)
-	if err != nil {
-		return t, errors.Wrap(err, "failed to parse buildkit config")
-	}
-	var bkcfg config.Config
-	if err = t.Unmarshal(&bkcfg); err != nil {
-		return t, errors.Wrap(err, "failed to parse buildkit config")
-	}
-	return t, nil
 }

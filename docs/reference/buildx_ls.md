@@ -1,7 +1,7 @@
 # buildx ls
 
 ```text
-docker buildx ls
+docker buildx ls [OPTIONS]
 ```
 
 <!---MARKER_GEN_START-->
@@ -9,11 +9,12 @@ List builder instances
 
 ### Options
 
-| Name                  | Type     | Default | Description           |
-|:----------------------|:---------|:--------|:----------------------|
-| `-D`, `--debug`       | `bool`   |         | Enable debug logging  |
-| [`--format`](#format) | `string` | `table` | Format the output     |
-| `--no-trunc`          | `bool`   |         | Don't truncate output |
+| Name                  | Type       | Default | Description                                             |
+|:----------------------|:-----------|:--------|:--------------------------------------------------------|
+| `-D`, `--debug`       | `bool`     |         | Enable debug logging                                    |
+| [`--format`](#format) | `string`   | `table` | Format the output                                       |
+| `--no-trunc`          | `bool`     |         | Don't truncate output                                   |
+| `--timeout`           | `duration` | `20s`   | Override the default timeout for loading builder status |
 
 
 <!---MARKER_GEN_END-->

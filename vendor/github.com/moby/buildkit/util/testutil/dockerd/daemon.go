@@ -2,6 +2,7 @@ package dockerd
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -16,12 +17,12 @@ import (
 )
 
 type LogT interface {
-	Logf(string, ...interface{})
+	Logf(string, ...any)
 }
 
 type nopLog struct{}
 
-func (nopLog) Logf(string, ...interface{}) {}
+func (nopLog) Logf(string, ...any) {}
 
 const (
 	shortLen             = 12
@@ -72,8 +73,8 @@ func NewDaemon(workingDir string, ops ...Option) (*Daemon, error) {
 		execRoot:      filepath.Join(os.TempDir(), "dxr", id),
 		dockerdBinary: DefaultDockerdBinary,
 		Log:           nopLog{},
-		sockPath:      filepath.Join(sockRoot, id+".sock"),
-		envs:          append([]string{}, os.Environ()...),
+		sockPath:      getDockerdSockPath(sockRoot, id),
+		envs:          os.Environ(),
 	}
 
 	for _, op := range ops {
@@ -96,7 +97,7 @@ func WithExtraEnv(envs []string) Option {
 }
 
 func (d *Daemon) Sock() string {
-	return "unix://" + d.sockPath
+	return socketScheme + d.sockPath
 }
 
 func (d *Daemon) StartWithError(daemonLogs map[string]*bytes.Buffer, providedArgs ...string) error {
@@ -140,7 +141,7 @@ func (d *Daemon) StartWithError(daemonLogs map[string]*bytes.Buffer, providedArg
 	}
 
 	d.args = append(d.args, providedArgs...)
-	d.cmd = exec.Command(dockerdBinary, d.args...)
+	d.cmd = exec.CommandContext(context.TODO(), dockerdBinary, d.args...)
 	d.cmd.Env = append(d.envs, "DOCKER_SERVICE_PREFER_OFFLINE_IMAGE=1", "BUILDKIT_DEBUG_EXEC_OUTPUT=1", "BUILDKIT_DEBUG_PANIC_ON_ERROR=1")
 
 	if daemonLogs != nil {

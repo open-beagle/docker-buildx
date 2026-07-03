@@ -1,110 +1,126 @@
-package gitutil
+package gitutil_test
 
 import (
+	"context"
+	"strings"
 	"testing"
 
+	"github.com/docker/buildx/util/gitutil"
+	"github.com/docker/buildx/util/gitutil/gittestutil"
 	"github.com/stretchr/testify/require"
 )
 
 func TestGit(t *testing.T) {
-	c, err := New()
+	ctx := context.TODO()
+	gittestutil.Mktmp(t)
+	c, err := gitutil.New()
 	require.NoError(t, err)
 
-	out, err := c.run("status")
+	gittestutil.GitInit(c, t)
+	gittestutil.GitCommit(c, t, "bar")
+
+	out, err := c.Run(ctx, "status")
 	require.NoError(t, err)
 	require.NotEmpty(t, out)
 
-	out, err = c.clean(c.run("not-exist"))
+	out, err = c.Run(ctx, "not-exist")
 	require.Error(t, err)
 	require.Empty(t, out)
-	require.Equal(t, "git: 'not-exist' is not a git command. See 'git --help'.", err.Error())
+	require.Contains(t, err.Error(), "git: 'not-exist' is not a git command. See 'git --help'.")
 }
 
 func TestGitFullCommit(t *testing.T) {
-	Mktmp(t)
-	c, err := New()
+	ctx := context.TODO()
+	gittestutil.Mktmp(t)
+	c, err := gitutil.New()
 	require.NoError(t, err)
 
-	GitInit(c, t)
-	GitCommit(c, t, "bar")
+	gittestutil.GitInit(c, t)
+	gittestutil.GitCommit(c, t, "bar")
 
-	out, err := c.FullCommit()
+	out, err := c.FullCommit(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 40, len(out))
 }
 
 func TestGitShortCommit(t *testing.T) {
-	Mktmp(t)
-	c, err := New()
+	ctx := context.TODO()
+	gittestutil.Mktmp(t)
+	c, err := gitutil.New()
 	require.NoError(t, err)
 
-	GitInit(c, t)
-	GitCommit(c, t, "bar")
+	gittestutil.GitInit(c, t)
+	gittestutil.GitCommit(c, t, "bar")
 
-	out, err := c.ShortCommit()
+	out, err := c.ShortCommit(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 7, len(out))
 }
 
 func TestGitFullCommitErr(t *testing.T) {
-	Mktmp(t)
-	c, err := New()
+	ctx := context.TODO()
+	gittestutil.Mktmp(t)
+	c, err := gitutil.New()
 	require.NoError(t, err)
 
-	GitInit(c, t)
+	gittestutil.GitInit(c, t)
 
-	_, err = c.FullCommit()
+	_, err = c.FullCommit(ctx)
 	require.Error(t, err)
-	require.True(t, IsUnknownRevision(err))
-	require.False(t, IsAmbiguousArgument(err))
+	require.True(t, gitutil.IsUnknownRevision(err))
+	require.False(t, gittestutil.IsAmbiguousArgument(err))
 }
 
 func TestGitShortCommitErr(t *testing.T) {
-	Mktmp(t)
-	c, err := New()
+	ctx := context.TODO()
+	gittestutil.Mktmp(t)
+	c, err := gitutil.New()
 	require.NoError(t, err)
 
-	GitInit(c, t)
+	gittestutil.GitInit(c, t)
 
-	_, err = c.ShortCommit()
+	_, err = c.ShortCommit(ctx)
 	require.Error(t, err)
-	require.True(t, IsUnknownRevision(err))
-	require.False(t, IsAmbiguousArgument(err))
+	require.True(t, gitutil.IsUnknownRevision(err))
+	require.False(t, gittestutil.IsAmbiguousArgument(err))
 }
 
 func TestGitTagsPointsAt(t *testing.T) {
-	Mktmp(t)
-	c, err := New()
+	ctx := context.TODO()
+	gittestutil.Mktmp(t)
+	c, err := gitutil.New()
 	require.NoError(t, err)
 
-	GitInit(c, t)
-	GitCommit(c, t, "bar")
-	GitTag(c, t, "v0.8.0")
-	GitCommit(c, t, "foo")
-	GitTag(c, t, "v0.9.0")
+	gittestutil.GitInit(c, t)
+	gittestutil.GitCommit(c, t, "bar")
+	gittestutil.GitTag(c, t, "v0.8.0")
+	gittestutil.GitCommit(c, t, "foo")
+	gittestutil.GitTag(c, t, "v0.9.0")
 
-	out, err := c.clean(c.run("tag", "--points-at", "HEAD", "--sort", "-version:creatordate"))
+	out, err := c.Run(ctx, "tag", "--points-at", "HEAD", "--sort", "-version:creatordate")
 	require.NoError(t, err)
-	require.Equal(t, "v0.9.0", out)
+	require.Equal(t, "v0.9.0", strings.TrimSpace(string(out)))
 }
 
 func TestGitDescribeTags(t *testing.T) {
-	Mktmp(t)
-	c, err := New()
+	ctx := context.TODO()
+	gittestutil.Mktmp(t)
+	c, err := gitutil.New()
 	require.NoError(t, err)
 
-	GitInit(c, t)
-	GitCommit(c, t, "bar")
-	GitTag(c, t, "v0.8.0")
-	GitCommit(c, t, "foo")
-	GitTag(c, t, "v0.9.0")
+	gittestutil.GitInit(c, t)
+	gittestutil.GitCommit(c, t, "bar")
+	gittestutil.GitTag(c, t, "v0.8.0")
+	gittestutil.GitCommit(c, t, "foo")
+	gittestutil.GitTag(c, t, "v0.9.0")
 
-	out, err := c.clean(c.run("describe", "--tags", "--abbrev=0"))
+	out, err := c.Run(ctx, "describe", "--tags", "--abbrev=0")
 	require.NoError(t, err)
-	require.Equal(t, "v0.9.0", out)
+	require.Equal(t, "v0.9.0", strings.TrimSpace(string(out)))
 }
 
 func TestGitRemoteURL(t *testing.T) {
+	ctx := context.TODO()
 	type remote struct {
 		name     string
 		url      string
@@ -198,70 +214,27 @@ func TestGitRemoteURL(t *testing.T) {
 		},
 	}
 	for _, tt := range cases {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			Mktmp(t)
-			c, err := New()
+			gittestutil.Mktmp(t)
+			c, err := gitutil.New()
 			require.NoError(t, err)
 
-			GitInit(c, t)
-			GitCommit(c, t, "initial commit")
+			gittestutil.GitInit(c, t)
+			gittestutil.GitCommit(c, t, "initial commit")
 			for _, r := range tt.remotes {
-				GitSetRemote(c, t, r.name, r.url)
+				gittestutil.GitSetRemote(c, t, r.name, r.url)
 				if r.tracking != "" {
-					GitSetMainUpstream(c, t, r.name, r.tracking)
+					gittestutil.GitSetMainUpstream(c, t, r.name, r.tracking)
 				}
 			}
 
-			ru, err := c.RemoteURL()
+			ru, err := c.RemoteURL(ctx)
 			if tt.fail {
 				require.Error(t, err)
 				return
 			}
 			require.NoError(t, err)
 			require.Equal(t, tt.expected, ru)
-		})
-	}
-}
-
-func TestStripCredentials(t *testing.T) {
-	cases := []struct {
-		name string
-		url  string
-		want string
-	}{
-		{
-			name: "non-blank Password",
-			url:  "https://user:password@host.tld/this:that",
-			want: "https://host.tld/this:that",
-		},
-		{
-			name: "blank Password",
-			url:  "https://user@host.tld/this:that",
-			want: "https://host.tld/this:that",
-		},
-		{
-			name: "blank Username",
-			url:  "https://:password@host.tld/this:that",
-			want: "https://host.tld/this:that",
-		},
-		{
-			name: "blank Username, blank Password",
-			url:  "https://host.tld/this:that",
-			want: "https://host.tld/this:that",
-		},
-		{
-			name: "invalid URL",
-			url:  "1https://foo.com",
-			want: "1https://foo.com",
-		},
-	}
-	for _, tt := range cases {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			if g, w := stripCredentials(tt.url), tt.want; g != w {
-				t.Fatalf("got: %q\nwant: %q", g, w)
-			}
 		})
 	}
 }

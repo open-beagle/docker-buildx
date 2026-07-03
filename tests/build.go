@@ -1,7 +1,9 @@
 package tests
 
 import (
+	"archive/tar"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,13 +15,17 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/plugins/content/local"
 	"github.com/containerd/continuity/fs/fstest"
 	"github.com/containerd/platforms"
 	"github.com/creack/pty"
 	"github.com/docker/buildx/localstate"
 	"github.com/docker/buildx/util/confutil"
 	"github.com/docker/buildx/util/gitutil"
+	"github.com/docker/buildx/util/gitutil/gittestutil"
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/client/ociindex"
 	"github.com/moby/buildkit/frontend/subrequests/lint"
 	"github.com/moby/buildkit/frontend/subrequests/outline"
 	"github.com/moby/buildkit/frontend/subrequests/targets"
@@ -27,9 +33,12 @@ import (
 	provenancetypes "github.com/moby/buildkit/solver/llbsolver/provenance/types"
 	"github.com/moby/buildkit/util/appdefaults"
 	"github.com/moby/buildkit/util/contentutil"
+	bkgitutil "github.com/moby/buildkit/util/gitutil"
 	"github.com/moby/buildkit/util/testutil"
 	"github.com/moby/buildkit/util/testutil/integration"
 	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/specs-go"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,6 +56,8 @@ var buildTests = []func(t *testing.T, sb integration.Sandbox){
 	testBuildAlias,
 	testBuildStdin,
 	testBuildRemote,
+	testBuildRemoteAuth,
+	testBuildNamedContextOCILayoutDigestOnly,
 	testBuildLocalState,
 	testBuildLocalStateStdin,
 	testBuildLocalStateRemote,
@@ -60,6 +71,7 @@ var buildTests = []func(t *testing.T, sb integration.Sandbox){
 	testBuildProgress,
 	testBuildAnnotations,
 	testBuildBuildArgNoKey,
+	testBuildBuildKitSyntaxEmpty,
 	testBuildLabelNoKey,
 	testBuildCacheExportNotSupported,
 	testBuildOCIExportNotSupported,
@@ -69,13 +81,16 @@ var buildTests = []func(t *testing.T, sb integration.Sandbox){
 	testBuildShmSize,
 	testBuildUlimit,
 	testBuildMetadataProvenance,
+	testBuildMetadataProvenanceMultiplatform,
 	testBuildMetadataWarnings,
 	testBuildMultiExporters,
 	testBuildLoadPush,
 	testBuildSecret,
 	testBuildDefaultLoad,
 	testBuildCall,
-	testCheckCallOutput,
+	testBuildCheckCallOutput,
+	testBuildExtraHosts,
+	testBuildIndexAnnotationsLoadDocker,
 }
 
 func testBuild(t *testing.T, sb integration.Sandbox) {
@@ -102,7 +117,7 @@ COPY --from=base /etc/bar /bar
 `)
 	dir := tmpdir(
 		t,
-		fstest.CreateFile("foo", []byte("foo"), 0600),
+		fstest.CreateFile("foo", []byte("foo"), 0o600),
 	)
 
 	cmd := buildxCmd(sb, withDir(dir), withArgs("build", "--progress=quiet", "-f-", dir))
@@ -112,28 +127,219 @@ COPY --from=base /etc/bar /bar
 }
 
 func testBuildRemote(t *testing.T, sb integration.Sandbox) {
+	t.Run("default branch", func(t *testing.T) {
+		dockerfile := []byte(`
+FROM busybox:latest
+COPY foo /foo
+`)
+		dir := tmpdir(
+			t,
+			fstest.CreateFile("Dockerfile", dockerfile, 0o600),
+			fstest.CreateFile("foo", []byte("foo"), 0o600),
+		)
+		dirDest := t.TempDir()
+
+		git, err := gitutil.New(bkgitutil.WithDir(dir))
+		require.NoError(t, err)
+
+		gittestutil.GitInit(git, t)
+		gittestutil.GitAdd(git, t, "Dockerfile", "foo")
+		gittestutil.GitCommit(git, t, "initial commit")
+		addr := gittestutil.GitServeHTTP(git, t)
+
+		out, err := buildCmd(sb, withDir(dir), withArgs("--output=type=local,dest="+dirDest, addr))
+		require.NoError(t, err, out)
+		require.FileExists(t, filepath.Join(dirDest, "foo"))
+	})
+
+	t.Run("tag ref with url fragment", func(t *testing.T) {
+		dockerfile := []byte(`
+FROM busybox:latest
+COPY foo /foo
+`)
+		dir := tmpdir(
+			t,
+			fstest.CreateFile("Dockerfile", dockerfile, 0o600),
+			fstest.CreateFile("foo", []byte("foo"), 0o600),
+		)
+		dirDest := t.TempDir()
+
+		git, err := gitutil.New(bkgitutil.WithDir(dir))
+		require.NoError(t, err)
+
+		gittestutil.GitInit(git, t)
+		gittestutil.GitAdd(git, t, "Dockerfile", "foo")
+		gittestutil.GitCommit(git, t, "initial commit")
+		gittestutil.GitTag(git, t, "v0.1.0")
+		addr := gittestutil.GitServeHTTP(git, t)
+		addr = addr + "#v0.1.0" // tag
+
+		out, err := buildCmd(sb, withDir(dir), withArgs("--output=type=local,dest="+dirDest, addr))
+		require.NoError(t, err, out)
+		require.FileExists(t, filepath.Join(dirDest, "foo"))
+	})
+
+	t.Run("tag ref with query string", func(t *testing.T) {
+		dockerfile := []byte(`
+FROM busybox:latest
+COPY foo /foo
+`)
+		dir := tmpdir(
+			t,
+			fstest.CreateFile("Dockerfile", dockerfile, 0o600),
+			fstest.CreateFile("foo", []byte("foo"), 0o600),
+		)
+		dirDest := t.TempDir()
+
+		git, err := gitutil.New(bkgitutil.WithDir(dir))
+		require.NoError(t, err)
+
+		gittestutil.GitInit(git, t)
+		gittestutil.GitAdd(git, t, "Dockerfile", "foo")
+		gittestutil.GitCommit(git, t, "initial commit")
+		gittestutil.GitTag(git, t, "v0.1.0")
+		addr := gittestutil.GitServeHTTP(git, t)
+		addr = addr + "?tag=v0.1.0" // tag
+
+		out, err := buildCmd(sb, withDir(dir), withArgs("--output=type=local,dest="+dirDest, addr))
+		if matchesBuildKitVersion(t, sb, ">= 0.24.0-0") {
+			require.NoError(t, err, out)
+			require.FileExists(t, filepath.Join(dirDest, "foo"))
+		} else {
+			require.Error(t, err)
+			require.Contains(t, out, "current frontend does not support Git URLs with query string components")
+		}
+	})
+
+	t.Run("tag ref with query string frontend 1.17", func(t *testing.T) {
+		dockerfile := []byte(`
+# syntax=docker/dockerfile:1.17
+FROM busybox:latest
+COPY foo /foo
+`)
+		dir := tmpdir(
+			t,
+			fstest.CreateFile("Dockerfile", dockerfile, 0o600),
+			fstest.CreateFile("foo", []byte("foo"), 0o600),
+		)
+		dirDest := t.TempDir()
+
+		git, err := gitutil.New(bkgitutil.WithDir(dir))
+		require.NoError(t, err)
+
+		gittestutil.GitInit(git, t)
+		gittestutil.GitAdd(git, t, "Dockerfile", "foo")
+		gittestutil.GitCommit(git, t, "initial commit")
+		gittestutil.GitTag(git, t, "v0.1.0")
+		addr := gittestutil.GitServeHTTP(git, t)
+		addr = addr + "?tag=v0.1.0" // tag
+
+		out, err := buildCmd(sb, withDir(dir), withArgs("--output=type=local,dest="+dirDest, addr))
+		if matchesBuildKitVersion(t, sb, ">= 0.24.0-0") {
+			require.NoError(t, err, out)
+			require.FileExists(t, filepath.Join(dirDest, "foo"))
+		} else {
+			require.Error(t, err)
+			require.Contains(t, out, "current frontend does not support Git URLs with query string components")
+		}
+	})
+
+	t.Run("tag ref with query string frontend 1.18.0", func(t *testing.T) {
+		dockerfile := []byte(`
+# syntax=docker/dockerfile-upstream:1.18.0
+FROM busybox:latest
+COPY foo /foo
+`)
+		dir := tmpdir(
+			t,
+			fstest.CreateFile("Dockerfile", dockerfile, 0o600),
+			fstest.CreateFile("foo", []byte("foo"), 0o600),
+		)
+		dirDest := t.TempDir()
+
+		git, err := gitutil.New(bkgitutil.WithDir(dir))
+		require.NoError(t, err)
+
+		gittestutil.GitInit(git, t)
+		gittestutil.GitAdd(git, t, "Dockerfile", "foo")
+		gittestutil.GitCommit(git, t, "initial commit")
+		gittestutil.GitTag(git, t, "v0.1.0")
+		addr := gittestutil.GitServeHTTP(git, t)
+		addr = addr + "?tag=v0.1.0" // tag
+
+		out, err := buildCmd(sb, withDir(dir), withArgs("--output=type=local,dest="+dirDest, addr))
+		if matchesBuildKitVersion(t, sb, ">= 0.24.0-0") {
+			require.NoError(t, err, out)
+			require.FileExists(t, filepath.Join(dirDest, "foo"))
+		} else {
+			require.Error(t, err)
+			require.Contains(t, out, "current frontend does not support Git URLs with query string components")
+		}
+	})
+}
+
+func testBuildRemoteAuth(t *testing.T, sb integration.Sandbox) {
 	dockerfile := []byte(`
 FROM busybox:latest
 COPY foo /foo
 `)
 	dir := tmpdir(
 		t,
-		fstest.CreateFile("Dockerfile", dockerfile, 0600),
-		fstest.CreateFile("foo", []byte("foo"), 0600),
+		fstest.CreateFile("Dockerfile", dockerfile, 0o600),
+		fstest.CreateFile("foo", []byte("foo"), 0o600),
 	)
 	dirDest := t.TempDir()
 
-	git, err := gitutil.New(gitutil.WithWorkingDir(dir))
+	git, err := gitutil.New(bkgitutil.WithDir(dir))
 	require.NoError(t, err)
 
-	gitutil.GitInit(git, t)
-	gitutil.GitAdd(git, t, "Dockerfile", "foo")
-	gitutil.GitCommit(git, t, "initial commit")
-	addr := gitutil.GitServeHTTP(git, t)
+	gittestutil.GitInit(git, t)
+	gittestutil.GitAdd(git, t, "Dockerfile", "foo")
+	gittestutil.GitCommit(git, t, "initial commit")
 
-	out, err := buildCmd(sb, withDir(dir), withArgs("--output=type=local,dest="+dirDest, addr))
+	token := identity.NewID()
+	addr := gittestutil.GitServeHTTP(git, t, gittestutil.WithAccessToken(token))
+
+	out, err := buildCmd(sb, withDir(dir),
+		withEnv("GIT_AUTH_TOKEN="+token),
+		withArgs(
+			"--secret", "id=GIT_AUTH_TOKEN,env=GIT_AUTH_TOKEN",
+			"--output=type=local,dest="+dirDest,
+			addr,
+		),
+	)
 	require.NoError(t, err, out)
+
 	require.FileExists(t, filepath.Join(dirDest, "foo"))
+}
+
+func testBuildNamedContextOCILayoutDigestOnly(t *testing.T, sb integration.Sandbox) {
+	if isMobyWorker(sb) {
+		t.Skip("oci-layout named contexts are not supported by the docker worker")
+	}
+
+	dir := tmpdir(t, fstest.CreateFile("Dockerfile", []byte(`
+FROM scratch
+COPY --from=proxy /foo /foo
+`), 0o600))
+	layoutPath := filepath.Join(dir, "layout")
+	expected := "from-oci-layout"
+	manifestDigest := createOCILayoutImage(t, layoutPath, "foo", []byte(expected), "latest")
+	dirDest := t.TempDir()
+
+	out, err := buildCmd(sb,
+		withDir(dir),
+		withArgs(
+			"--build-context", "proxy=oci-layout://layout@"+manifestDigest.String(),
+			"--output=type=local,dest="+dirDest,
+			dir,
+		),
+	)
+	require.NoError(t, err, out)
+
+	dt, err := os.ReadFile(filepath.Join(dirDest, "foo"))
+	require.NoError(t, err)
+	require.Equal(t, expected, string(dt))
 }
 
 func testBuildLocalState(t *testing.T, sb integration.Sandbox) {
@@ -147,8 +353,8 @@ COPY --from=base /etc/bar /bar
 `)
 	dir := tmpdir(
 		t,
-		fstest.CreateFile("build.Dockerfile", dockerfile, 0600),
-		fstest.CreateFile("foo", []byte("foo"), 0600),
+		fstest.CreateFile("build.Dockerfile", dockerfile, 0o600),
+		fstest.CreateFile("foo", []byte("foo"), 0o600),
 	)
 
 	out, err := buildCmd(sb, withDir(dir), withArgs(
@@ -192,7 +398,7 @@ COPY --from=base /etc/bar /bar
 `)
 	dir := tmpdir(
 		t,
-		fstest.CreateFile("foo", []byte("foo"), 0600),
+		fstest.CreateFile("foo", []byte("foo"), 0o600),
 	)
 
 	cmd := buildxCmd(sb, withDir(dir), withArgs("build", "--progress=quiet", "--metadata-file", filepath.Join(dir, "md.json"), "-f-", dir))
@@ -230,18 +436,18 @@ COPY foo /foo
 `)
 	dir := tmpdir(
 		t,
-		fstest.CreateFile("build.Dockerfile", dockerfile, 0600),
-		fstest.CreateFile("foo", []byte("foo"), 0600),
+		fstest.CreateFile("build.Dockerfile", dockerfile, 0o600),
+		fstest.CreateFile("foo", []byte("foo"), 0o600),
 	)
 	dirDest := t.TempDir()
 
-	git, err := gitutil.New(gitutil.WithWorkingDir(dir))
+	git, err := gitutil.New(bkgitutil.WithDir(dir))
 	require.NoError(t, err)
 
-	gitutil.GitInit(git, t)
-	gitutil.GitAdd(git, t, "build.Dockerfile", "foo")
-	gitutil.GitCommit(git, t, "initial commit")
-	addr := gitutil.GitServeHTTP(git, t)
+	gittestutil.GitInit(git, t)
+	gittestutil.GitAdd(git, t, "build.Dockerfile", "foo")
+	gittestutil.GitCommit(git, t, "initial commit")
+	addr := gittestutil.GitServeHTTP(git, t)
 
 	out, err := buildCmd(sb, withDir(dir), withArgs(
 		"-f", "build.Dockerfile",
@@ -287,10 +493,11 @@ func testBuildLocalExport(t *testing.T, sb integration.Sandbox) {
 
 func testBuildTarExport(t *testing.T, sb integration.Sandbox) {
 	dir := createTestProject(t)
-	out, err := buildCmd(sb, withArgs(fmt.Sprintf("--output=type=tar,dest=%s/result.tar", dir), dir))
+	outdir := path.Join(dir, "out")
+	out, err := buildCmd(sb, withArgs(fmt.Sprintf("--output=type=tar,dest=%s/result.tar", outdir), dir))
 	require.NoError(t, err, string(out))
 
-	dt, err := os.ReadFile(fmt.Sprintf("%s/result.tar", dir))
+	dt, err := os.ReadFile(fmt.Sprintf("%s/result.tar", outdir))
 	require.NoError(t, err)
 	m, err := testutil.ReadTarToMap(dt, false)
 	require.NoError(t, err)
@@ -366,7 +573,7 @@ func testImageIDOutput(t *testing.T, sb integration.Sandbox) {
 	dockerfile := []byte(`FROM busybox:latest`)
 
 	dir := tmpdir(t,
-		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("Dockerfile", dockerfile, 0o600),
 	)
 	targetDir := t.TempDir()
 
@@ -398,18 +605,25 @@ func testImageIDOutput(t *testing.T, sb integration.Sandbox) {
 
 	require.Equal(t, dgst.String(), strings.TrimSpace(stdout.String()))
 
+	// read the md.json file
 	dt, err = os.ReadFile(filepath.Join(targetDir, "md.json"))
 	require.NoError(t, err)
 
 	type mdT struct {
+		Digest       string `json:"containerimage.digest"`
 		ConfigDigest string `json:"containerimage.config.digest"`
 	}
+
 	var md mdT
 	err = json.Unmarshal(dt, &md)
 	require.NoError(t, err)
 
 	require.NotEmpty(t, md.ConfigDigest)
-	require.Equal(t, dgst, digest.Digest(md.ConfigDigest))
+	require.NotEmpty(t, md.Digest)
+
+	// verify the image ID output is correct
+	// XXX: improve this by checking that it's one of the two expected digests depending on the scenario.
+	require.Contains(t, []digest.Digest{digest.Digest(md.ConfigDigest), digest.Digest(md.Digest)}, dgst)
 }
 
 func testBuildMobyFromLocalImage(t *testing.T, sb integration.Sandbox) {
@@ -432,7 +646,7 @@ func testBuildMobyFromLocalImage(t *testing.T, sb integration.Sandbox) {
 
 	// build image
 	dockerfile := []byte(`FROM buildx-test:busybox`)
-	dir := tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0600))
+	dir := tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0o600))
 	cmd = buildxCmd(
 		sb,
 		withArgs("build", "-q", "--output=type=cacheonly", dir),
@@ -451,7 +665,7 @@ func testBuildMobyFromLocalImage(t *testing.T, sb integration.Sandbox) {
 FROM busybox:1.35
 RUN busybox | head -1 | grep v1.36.1
 `)
-	dir = tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0600))
+	dir = tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0o600))
 	cmd = buildxCmd(
 		sb,
 		withArgs("build", "-q", "--output=type=cacheonly", dir),
@@ -467,7 +681,7 @@ func testBuildDetailsLink(t *testing.T, sb integration.Sandbox) {
 	// build simple dockerfile
 	dockerfile := []byte(`FROM busybox:latest
 RUN echo foo > /bar`)
-	dir := tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0600))
+	dir := tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0o600))
 	cmd := buildxCmd(sb, withArgs("build", "--output=type=cacheonly", dir))
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
@@ -477,7 +691,7 @@ RUN echo foo > /bar`)
 	home, err := os.UserHomeDir() // TODO: sandbox should create a temp home dir and expose it through its interface
 	require.NoError(t, err)
 	dbDir := path.Join(home, ".docker", "desktop-build")
-	require.NoError(t, os.MkdirAll(dbDir, 0755))
+	require.NoError(t, os.MkdirAll(dbDir, 0o755))
 	dblaFile, err := os.Create(path.Join(dbDir, ".lastaccess"))
 	require.NoError(t, err)
 	defer func() {
@@ -496,7 +710,7 @@ RUN echo foo > /bar`)
 	// build erroneous dockerfile
 	dockerfile = []byte(`FROM busybox:latest
 RUN exit 1`)
-	dir = tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0600))
+	dir = tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0o600))
 	cmd = buildxCmd(sb, withArgs("build", "--output=type=cacheonly", dir))
 	out, err = cmd.CombinedOutput()
 	require.Error(t, err, string(out))
@@ -510,7 +724,10 @@ func testBuildProgress(t *testing.T, sb integration.Sandbox) {
 
 	// progress=tty
 	cmd := buildxCmd(sb, withArgs("build", "--progress=tty", "--output=type=cacheonly", dir))
-	f, err := pty.Start(cmd)
+	f, err := pty.StartWithSize(cmd, &pty.Winsize{
+		Cols: 120,
+		Rows: 24,
+	})
 	require.NoError(t, err)
 	buf := bytes.NewBuffer(nil)
 	io.Copy(buf, f)
@@ -581,6 +798,14 @@ func testBuildBuildArgNoKey(t *testing.T, sb integration.Sandbox) {
 	require.Equal(t, `ERROR: invalid key-value pair "=TEST_STRING": empty key`, strings.TrimSpace(string(out)))
 }
 
+func testBuildBuildKitSyntaxEmpty(t *testing.T, sb integration.Sandbox) {
+	dir := createTestProject(t)
+	cmd := buildxCmd(sb, withArgs("build", "--build-arg", "BUILDKIT_SYNTAX=", dir))
+	out, err := cmd.CombinedOutput()
+	require.Error(t, err, string(out))
+	require.Contains(t, string(out), `empty BUILDKIT_SYNTAX build-arg is invalid, use --build-arg BUILDKIT_SYNTAX without '=' for optional behavior`)
+}
+
 func testBuildLabelNoKey(t *testing.T, sb integration.Sandbox) {
 	dir := createTestProject(t)
 	cmd := buildxCmd(sb, withArgs("build", "--label", "=TEST_STRING", dir))
@@ -624,8 +849,8 @@ func testBuildMultiPlatform(t *testing.T, sb integration.Sandbox) {
 	`)
 	dir := tmpdir(
 		t,
-		fstest.CreateFile("Dockerfile", dockerfile, 0600),
-		fstest.CreateFile("foo", []byte("foo"), 0600),
+		fstest.CreateFile("Dockerfile", dockerfile, 0o600),
+		fstest.CreateFile("foo", []byte("foo"), 0o600),
 	)
 	registry, err := sb.NewRegistry()
 	if errors.Is(err, integration.ErrRequirements) {
@@ -660,7 +885,7 @@ func testDockerHostGateway(t *testing.T, sb integration.Sandbox) {
 FROM busybox
 RUN ping -c 1 buildx.host-gateway-ip.local
 `)
-	dir := tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0600))
+	dir := tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0o600))
 	cmd := buildxCmd(sb, withArgs("build", "--add-host=buildx.host-gateway-ip.local:host-gateway", "--output=type=cacheonly", dir))
 	out, err := cmd.CombinedOutput()
 	if !isDockerWorker(sb) {
@@ -699,7 +924,7 @@ RUN ip a show eth0 | awk '/inet / {split($2, a, "/"); print a[1]}' > /ip-bridge.
 RUN --network=host ip a show eth0 | awk '/inet / {split($2, a, "/"); print a[1]}' > /ip-host.txt
 FROM scratch
 COPY --from=build /ip*.txt /`)
-	dir := tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0600))
+	dir := tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0o600))
 
 	cmd := buildxCmd(sb, withArgs("build", "--allow=network.host", fmt.Sprintf("--output=type=local,dest=%s", dir), dir))
 	cmd.Env = append(cmd.Env, "BUILDX_BUILDER="+builderName)
@@ -734,7 +959,7 @@ COPY --from=build /shmsize /
 	`)
 	dir := tmpdir(
 		t,
-		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("Dockerfile", dockerfile, 0o600),
 	)
 
 	cmd := buildxCmd(sb, withArgs("build", "--shm-size=128m", fmt.Sprintf("--output=type=local,dest=%s", dir), dir))
@@ -755,7 +980,7 @@ COPY --from=build /ulimit /
 	`)
 	dir := tmpdir(
 		t,
-		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("Dockerfile", dockerfile, 0o600),
 	)
 
 	cmd := buildxCmd(sb, withArgs("build", "--ulimit=nofile=1024:1024", fmt.Sprintf("--output=type=local,dest=%s", dir), dir))
@@ -804,8 +1029,8 @@ func buildMetadataProvenance(t *testing.T, sb integration.Sandbox, metadataMode 
 	require.NoError(t, err)
 
 	type mdT struct {
-		BuildRef        string                 `json:"buildx.build.ref"`
-		BuildProvenance map[string]interface{} `json:"buildx.build.provenance"`
+		BuildRef        string         `json:"buildx.build.ref"`
+		BuildProvenance map[string]any `json:"buildx.build.provenance"`
 	}
 	var md mdT
 	err = json.Unmarshal(dt, &md)
@@ -821,9 +1046,104 @@ func buildMetadataProvenance(t *testing.T, sb integration.Sandbox, metadataMode 
 	dtprv, err := json.Marshal(md.BuildProvenance)
 	require.NoError(t, err)
 
-	var prv provenancetypes.ProvenancePredicate
+	var prv provenancetypes.ProvenancePredicateSLSA02
 	require.NoError(t, json.Unmarshal(dtprv, &prv))
-	require.Equal(t, provenancetypes.BuildKitBuildType, prv.BuildType)
+	require.Equal(t, provenancetypes.BuildKitBuildType02, prv.BuildType)
+}
+
+func testBuildMetadataProvenanceMultiplatform(t *testing.T, sb integration.Sandbox) {
+	t.Run("default", func(t *testing.T) {
+		buildMetadataProvenanceMultiplatform(t, sb, "")
+	})
+	t.Run("max", func(t *testing.T) {
+		buildMetadataProvenanceMultiplatform(t, sb, "max")
+	})
+	t.Run("min", func(t *testing.T) {
+		buildMetadataProvenanceMultiplatform(t, sb, "min")
+	})
+	t.Run("disabled", func(t *testing.T) {
+		buildMetadataProvenanceMultiplatform(t, sb, "disabled")
+	})
+}
+
+func buildMetadataProvenanceMultiplatform(t *testing.T, sb integration.Sandbox, metadataMode string) {
+	if isMobyWorker(sb) {
+		t.Skip("multi-platform build is not supported")
+	}
+
+	dockerfile := []byte(`
+	FROM --platform=$BUILDPLATFORM busybox:latest AS base
+	COPY foo /etc/foo
+	RUN cp /etc/foo /etc/bar
+
+	FROM scratch
+	COPY --from=base /etc/bar /bar
+	`)
+	dir := tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0o600),
+		fstest.CreateFile("foo", []byte("foo"), 0o600),
+	)
+
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+	target := registry + "/buildx/registry:latest"
+
+	cmd := buildxCmd(sb,
+		withArgs("build",
+			"--platform=linux/amd64,linux/arm64",
+			"--metadata-file", filepath.Join(dir, "md.json"),
+			fmt.Sprintf("--output=type=image,name=%s,push=true", target),
+			dir,
+		),
+		withEnv("BUILDX_METADATA_PROVENANCE="+metadataMode),
+	)
+
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	desc, provider, err := contentutil.ProviderFromRef(target)
+	require.NoError(t, err)
+	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
+	require.NoError(t, err)
+
+	img := imgs.Find("linux/amd64")
+	require.NotNil(t, img)
+	img = imgs.Find("linux/arm64")
+	require.NotNil(t, img)
+
+	dt, err := os.ReadFile(filepath.Join(dir, "md.json"))
+	require.NoError(t, err)
+
+	type mdT struct {
+		BuildRef             string         `json:"buildx.build.ref"`
+		BuildProvenanceAmd64 map[string]any `json:"buildx.build.provenance/linux/amd64"`
+		BuildProvenanceArm64 map[string]any `json:"buildx.build.provenance/linux/arm64"`
+	}
+	var md mdT
+	err = json.Unmarshal(dt, &md)
+	require.NoError(t, err)
+
+	require.NotEmpty(t, md.BuildRef)
+	if metadataMode == "disabled" {
+		require.Empty(t, md.BuildProvenanceAmd64)
+		require.Empty(t, md.BuildProvenanceArm64)
+		return
+	}
+	require.NotEmpty(t, md.BuildProvenanceAmd64)
+	require.NotEmpty(t, md.BuildProvenanceArm64)
+
+	for _, prov := range []map[string]any{md.BuildProvenanceAmd64, md.BuildProvenanceArm64} {
+		dtprv, err := json.Marshal(prov)
+		require.NoError(t, err)
+
+		var prv provenancetypes.ProvenancePredicateSLSA02
+		require.NoError(t, json.Unmarshal(dtprv, &prv))
+		require.Equal(t, provenancetypes.BuildKitBuildType02, prv.BuildType)
+	}
 }
 
 func testBuildMetadataWarnings(t *testing.T, sb integration.Sandbox) {
@@ -849,7 +1169,7 @@ COPy --from=base \
 	`)
 	dir := tmpdir(
 		t,
-		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("Dockerfile", dockerfile, 0o600),
 	)
 
 	cmd := buildxCmd(
@@ -985,8 +1305,8 @@ COPY --from=build /token /
 	`)
 	dir := tmpdir(
 		t,
-		fstest.CreateFile("Dockerfile", dockerfile, 0600),
-		fstest.CreateFile("tokenfile", []byte(token), 0600),
+		fstest.CreateFile("Dockerfile", dockerfile, 0o600),
+		fstest.CreateFile("tokenfile", []byte(token), 0o600),
 	)
 
 	t.Run("env", func(t *testing.T) {
@@ -1074,7 +1394,7 @@ COPy --from=base \
 	`)
 		dir := tmpdir(
 			t,
-			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+			fstest.CreateFile("Dockerfile", dockerfile, 0o600),
 		)
 
 		cmd := buildxCmd(sb, withArgs("build", "--call=check,format=json", dir))
@@ -1109,7 +1429,7 @@ FROM second
 	`)
 		dir := tmpdir(
 			t,
-			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+			fstest.CreateFile("Dockerfile", dockerfile, 0o600),
 		)
 
 		cmd := buildxCmd(sb, withArgs("build", "--build-arg=BAR=678", "--target=target", "--call=outline,format=json", dir))
@@ -1142,6 +1462,33 @@ FROM second
 		require.Equal(t, 1, len(res.Sources))
 	})
 
+	// docker/buildx#3651
+	t.Run("outline-quiet-output", func(t *testing.T) {
+		dockerfile := []byte(`
+FROM busybox
+ARG FOO=bar
+`)
+		dir := tmpdir(
+			t,
+			fstest.CreateFile("Dockerfile", dockerfile, 0o600),
+		)
+
+		runOutline := func(args ...string) string {
+			cmd := buildxCmd(sb, withArgs(args...))
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+			require.NoError(t, cmd.Run(), stdout.String(), stderr.String())
+			return stdout.String()
+		}
+
+		quietOut := runOutline("build", "-q", "--call=outline", dir)
+		noneOut := runOutline("build", "--progress=none", "--call=outline", dir)
+		assert.Equal(t, noneOut, quietOut)
+		assert.False(t, strings.HasPrefix(quietOut, "\n"))
+	})
+
 	t.Run("targets", func(t *testing.T) {
 		dockerfile := []byte(`
 # build defines stage for compiling the binary
@@ -1159,7 +1506,7 @@ FROM second AS binary
 	`)
 		dir := tmpdir(
 			t,
-			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+			fstest.CreateFile("Dockerfile", dockerfile, 0o600),
 		)
 
 		cmd := buildxCmd(sb, withArgs("build", "--call=targets,format=json", dir))
@@ -1201,7 +1548,7 @@ COPy --from=base \
 	`)
 		dir := tmpdir(
 			t,
-			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+			fstest.CreateFile("Dockerfile", dockerfile, 0o600),
 		)
 
 		cmd := buildxCmd(sb, withArgs("build", "--call=check,format=json", "--metadata-file", filepath.Join(dir, "md.json"), dir))
@@ -1229,7 +1576,7 @@ COPy --from=base \
 	})
 }
 
-func testCheckCallOutput(t *testing.T, sb integration.Sandbox) {
+func testBuildCheckCallOutput(t *testing.T, sb integration.Sandbox) {
 	t.Run("check for warning count msg in check without warnings", func(t *testing.T) {
 		dockerfile := []byte(`
 FROM busybox AS base
@@ -1237,7 +1584,7 @@ COPY Dockerfile .
 	`)
 		dir := tmpdir(
 			t,
-			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+			fstest.CreateFile("Dockerfile", dockerfile, 0o600),
 		)
 
 		cmd := buildxCmd(sb, withArgs("build", "--call=check", dir))
@@ -1256,7 +1603,7 @@ COPY Dockerfile .
 	`)
 		dir := tmpdir(
 			t,
-			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+			fstest.CreateFile("Dockerfile", dockerfile, 0o600),
 		)
 
 		cmd := buildxCmd(sb, withArgs("build", "--call=check", dir))
@@ -1275,7 +1622,7 @@ cOpy Dockerfile .
 	`)
 		dir := tmpdir(
 			t,
-			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+			fstest.CreateFile("Dockerfile", dockerfile, 0o600),
 		)
 
 		cmd := buildxCmd(sb, withArgs("build", "--call=check", dir))
@@ -1294,8 +1641,8 @@ cOpy Dockerfile .
 	`)
 		dir := tmpdir(
 			t,
-			fstest.CreateDir("subdir", 0700),
-			fstest.CreateFile("subdir/Dockerfile", dockerfile, 0600),
+			fstest.CreateDir("subdir", 0o700),
+			fstest.CreateFile("subdir/Dockerfile", dockerfile, 0o600),
 		)
 		dockerfilePath := filepath.Join(dir, "subdir", "Dockerfile")
 
@@ -1311,6 +1658,35 @@ cOpy Dockerfile .
 	})
 }
 
+func testBuildExtraHosts(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+FROM busybox
+RUN cat /etc/hosts | grep myhost | grep 1.2.3.4
+RUN cat /etc/hosts | grep myhostmulti | grep 162.242.195.81
+RUN cat /etc/hosts | grep myhostmulti | grep 162.242.195.82
+`)
+	dir := tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0o600))
+	cmd := buildxCmd(sb, withArgs("build",
+		"--add-host=myhost=1.2.3.4",
+		"--add-host=myhostmulti=162.242.195.81",
+		"--add-host=myhostmulti=162.242.195.82",
+		"--output=type=cacheonly", dir),
+	)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+}
+
+func testBuildIndexAnnotationsLoadDocker(t *testing.T, sb integration.Sandbox) {
+	if sb.DockerAddress() == "" {
+		t.Skip("only testing with docker available")
+	}
+	skipNoCompatBuildKit(t, sb, ">= 0.11.0-0", "annotations")
+	dir := createTestProject(t)
+	out, err := buildCmd(sb, withArgs("--annotation", "index:foo=bar", "--provenance", "false", "--output", "type=docker", dir))
+	require.Error(t, err, out)
+	require.Contains(t, out, "index annotations not supported for single platform export")
+}
+
 func createTestProject(t *testing.T) string {
 	dockerfile := []byte(`
 FROM busybox:latest AS base
@@ -1320,10 +1696,82 @@ RUN cp /etc/foo /etc/bar
 FROM scratch
 COPY --from=base /etc/bar /bar
 `)
-	dir := tmpdir(
-		t,
-		fstest.CreateFile("Dockerfile", dockerfile, 0600),
-		fstest.CreateFile("foo", []byte("foo"), 0600),
+	dir := tmpdir(t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0o600),
+		fstest.CreateFile("foo", []byte("foo"), 0o600),
 	)
 	return dir
+}
+
+func createOCILayoutImage(t *testing.T, layoutPath, fileName string, fileContents []byte, tag string) digest.Digest {
+	t.Helper()
+
+	store, err := local.NewStore(layoutPath)
+	require.NoError(t, err)
+
+	layerBytes := bytes.NewBuffer(nil)
+	tw := tar.NewWriter(layerBytes)
+	err = tw.WriteHeader(&tar.Header{
+		Name: fileName,
+		Mode: 0o644,
+		Size: int64(len(fileContents)),
+	})
+	require.NoError(t, err)
+	_, err = tw.Write(fileContents)
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+
+	ctx := context.Background()
+	layerDesc := ocispecs.Descriptor{
+		MediaType: ocispecs.MediaTypeImageLayer,
+		Digest:    digest.FromBytes(layerBytes.Bytes()),
+		Size:      int64(layerBytes.Len()),
+	}
+	err = content.WriteBlob(ctx, store, "layer-"+layerDesc.Digest.String(), bytes.NewReader(layerBytes.Bytes()), layerDesc)
+	require.NoError(t, err)
+
+	cfgBytes, err := json.Marshal(ocispecs.Image{
+		Platform: ocispecs.Platform{
+			Architecture: "amd64",
+			OS:           "linux",
+		},
+		Config: ocispecs.ImageConfig{
+			WorkingDir: "/",
+		},
+		RootFS: ocispecs.RootFS{
+			Type:    "layers",
+			DiffIDs: []digest.Digest{layerDesc.Digest},
+		},
+	})
+	require.NoError(t, err)
+	cfgDesc := ocispecs.Descriptor{
+		MediaType: ocispecs.MediaTypeImageConfig,
+		Digest:    digest.FromBytes(cfgBytes),
+		Size:      int64(len(cfgBytes)),
+	}
+	err = content.WriteBlob(ctx, store, "config-"+cfgDesc.Digest.String(), bytes.NewReader(cfgBytes), cfgDesc)
+	require.NoError(t, err)
+
+	manifestBytes, err := json.Marshal(ocispecs.Manifest{
+		Versioned: specs.Versioned{
+			SchemaVersion: 2,
+		},
+		MediaType: ocispecs.MediaTypeImageManifest,
+		Config:    cfgDesc,
+		Layers:    []ocispecs.Descriptor{layerDesc},
+	})
+	require.NoError(t, err)
+	manifestDesc := ocispecs.Descriptor{
+		MediaType: ocispecs.MediaTypeImageManifest,
+		Digest:    digest.FromBytes(manifestBytes),
+		Size:      int64(len(manifestBytes)),
+	}
+	err = content.WriteBlob(ctx, store, "manifest-"+manifestDesc.Digest.String(), bytes.NewReader(manifestBytes), manifestDesc)
+	require.NoError(t, err)
+
+	idx := ociindex.NewStoreIndex(layoutPath)
+	err = idx.Put(manifestDesc, ociindex.Tag(tag))
+	require.NoError(t, err)
+
+	return manifestDesc.Digest
 }

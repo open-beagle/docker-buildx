@@ -3,50 +3,265 @@ package build
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/containerd/console"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/plugins/content/local"
 	"github.com/containerd/platforms"
 	"github.com/distribution/reference"
-	"github.com/docker/buildx/builder"
+	noderesolver "github.com/docker/buildx/build/resolver"
 	"github.com/docker/buildx/driver"
+	"github.com/docker/buildx/policy"
+	"github.com/docker/buildx/util/buildflags"
 	"github.com/docker/buildx/util/confutil"
 	"github.com/docker/buildx/util/dockerutil"
+	"github.com/docker/buildx/util/ocilayout"
 	"github.com/docker/buildx/util/osutil"
 	"github.com/docker/buildx/util/progress"
+	"github.com/docker/buildx/util/sourcemeta"
+	"github.com/docker/buildx/util/urlutil"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/client/ociindex"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
+	"github.com/moby/buildkit/frontend/dockerfile/dfgitutil"
+	"github.com/moby/buildkit/frontend/dockerui"
 	gateway "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/identity"
+	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/session/secrets/secretsprovider"
+	"github.com/moby/buildkit/session/sshforward/sshprovider"
 	"github.com/moby/buildkit/session/upload/uploadprovider"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/sourcepolicy/policysession"
 	"github.com/moby/buildkit/util/apicaps"
 	"github.com/moby/buildkit/util/entitlements"
+	"github.com/moby/buildkit/util/gitutil"
 	"github.com/opencontainers/go-digest"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"github.com/tonistiigi/fsutil"
 )
 
-func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *Options, bopts gateway.BuildOpts, cfg *confutil.Config, pw progress.Writer, docker *dockerutil.Client) (_ *client.SolveOpt, release func(), err error) {
+var sendGitQueryAsInput = sync.OnceValue(func() bool {
+	if v, ok := os.LookupEnv("BUILDX_SEND_GIT_QUERY_AS_INPUT"); ok {
+		if vv, err := strconv.ParseBool(v); err == nil {
+			return vv
+		}
+	}
+	return false
+})
+
+// defaultPolicyEnabled reports whether the builtin default source policy is
+// enabled via the BUILDX_DEFAULT_POLICY environment variable. It is opt-in
+// for now; a future release may flip the default to on.
+var defaultPolicyEnabled = sync.OnceValue(func() bool {
+	if v, ok := os.LookupEnv("BUILDX_DEFAULT_POLICY"); ok {
+		if vv, err := strconv.ParseBool(v); err == nil {
+			return vv
+		}
+	}
+	return false
+})
+
+// policyExplicitlyDisabled reports whether the user passed `--policy
+// disabled=true`, which suppresses both user-defined and builtin default
+// policies.
+func policyExplicitlyDisabled(configs []buildflags.PolicyConfig) bool {
+	for _, cfg := range configs {
+		if cfg.Disabled {
+			return true
+		}
+	}
+	return false
+}
+
+type policyProgressLogger struct {
+	ch      chan *client.SolveStatus
+	done    chan struct{}
+	dgst    digest.Digest
+	name    string
+	started time.Time
+	mu      sync.Mutex
+	timer   *time.Timer
+	window  int
+	open    bool
+	closed  bool
+}
+
+const policyProgressWindow = 500 * time.Millisecond
+
+func newPolicyProgressLogger(pw progress.Writer, name string) *policyProgressLogger {
+	if pw == nil {
+		return nil
+	}
+	ch, done := progress.NewChannel(pw)
+	dgst := digest.FromBytes([]byte(identity.NewID()))
+	return &policyProgressLogger{
+		ch:   ch,
+		done: done,
+		dgst: dgst,
+		name: name,
+	}
+}
+
+func (l *policyProgressLogger) Log(msg string) {
+	if l == nil || msg == "" {
+		return
+	}
+	needStart := false
+	var started time.Time
+	var window int
+
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return
+	}
+	if !l.open {
+		needStart = true
+		l.open = true
+		l.window++
+		window = l.window
+		started = time.Now()
+		l.started = started
+	} else {
+		window = l.window
+	}
+	if l.timer != nil {
+		l.timer.Stop()
+	}
+	l.timer = time.AfterFunc(policyProgressWindow, func() {
+		l.completeWindow(window, nil)
+	})
+	if needStart {
+		l.sendVertexStart(started)
+	}
+	if !strings.HasSuffix(msg, "\n") {
+		msg += "\n"
+	}
+	l.ch <- &client.SolveStatus{
+		Logs: []*client.VertexLog{{
+			Vertex:    l.dgst,
+			Stream:    1,
+			Data:      []byte(msg),
+			Timestamp: time.Now(),
+		}},
+	}
+	l.mu.Unlock()
+}
+
+func (l *policyProgressLogger) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		l.Log(string(p))
+	}
+	return len(p), nil
+}
+
+func (l *policyProgressLogger) Close(err error) {
+	if l == nil {
+		return
+	}
+	shouldComplete := false
+	var started time.Time
+
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return
+	}
+	l.closed = true
+	if l.open {
+		shouldComplete = true
+		started = l.started
+		l.open = false
+	} else if err != nil && !l.started.IsZero() {
+		shouldComplete = true
+		started = l.started
+	}
+	l.window++
+	if l.timer != nil {
+		l.timer.Stop()
+		l.timer = nil
+	}
+	if shouldComplete {
+		l.sendVertexComplete(started, err)
+	}
+	l.mu.Unlock()
+	close(l.ch)
+	<-l.done
+}
+
+func (l *policyProgressLogger) completeWindow(window int, err error) {
+	l.mu.Lock()
+	if l.closed || !l.open || window != l.window {
+		l.mu.Unlock()
+		return
+	}
+	started := l.started
+	l.open = false
+	l.sendVertexComplete(started, err)
+	l.mu.Unlock()
+}
+
+func (l *policyProgressLogger) sendVertexStart(started time.Time) {
+	vtx := client.Vertex{
+		Digest:  l.dgst,
+		Name:    l.name,
+		Started: &started,
+	}
+	l.ch <- &client.SolveStatus{Vertexes: []*client.Vertex{&vtx}}
+}
+
+func (l *policyProgressLogger) sendVertexComplete(started time.Time, err error) {
+	tm := time.Now()
+	vtx := client.Vertex{
+		Digest:    l.dgst,
+		Name:      l.name,
+		Started:   &started,
+		Completed: &tm,
+	}
+	if err != nil {
+		vtx.Error = err.Error()
+	}
+	l.ch <- &client.SolveStatus{Vertexes: []*client.Vertex{&vtx}}
+}
+
+func isPolicyEvaluationError(policies []*policy.Policy, err error) bool {
+	for _, p := range policies {
+		if p != nil && p.IsPolicyError(err) {
+			return true
+		}
+	}
+	return false
+}
+
+func toSolveOpt(ctx context.Context, np *noderesolver.ResolvedNode, multiDriver bool, opt *Options, bopts gateway.BuildOpts, cfg *confutil.Config, pw progress.Writer, docker *dockerutil.Client) (_ *client.SolveOpt, release func(error), err error) {
+	node := np.Node()
 	nodeDriver := node.Driver
-	defers := make([]func(), 0, 2)
-	releaseF := func() {
+	defers := make([]func(error), 0, 2)
+	releaseF := func(inErr error) {
 		for _, f := range defers {
-			f()
+			f(inErr)
 		}
 	}
 
 	defer func() {
 		if err != nil {
-			releaseF()
+			releaseF(err)
 		}
 	}()
 
@@ -107,6 +322,17 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *O
 
 	if opt.CgroupParent != "" {
 		so.FrontendAttrs["cgroup-parent"] = opt.CgroupParent
+	}
+
+	if v, ok := opt.BuildArgs["BUILDKIT_SYNTAX"]; ok {
+		cmdline := strings.TrimSpace(v)
+		if cmdline == "" {
+			return nil, nil, errors.Errorf("empty BUILDKIT_SYNTAX build-arg is invalid, use --build-arg BUILDKIT_SYNTAX without '=' for optional behavior")
+		}
+		p := strings.SplitN(cmdline, " ", 2)
+		so.Frontend = "gateway.v0"
+		so.FrontendAttrs["source"] = p[0]
+		so.FrontendAttrs["cmdline"] = v
 	}
 
 	if v, ok := opt.BuildArgs["BUILDKIT_MULTI_PLATFORM"]; ok {
@@ -173,6 +399,20 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *O
 		}
 	}
 
+	// check if index annotations are supported by docker driver
+	if len(opt.Exports) > 0 && opt.CallFunc == nil && len(opt.Annotations) > 0 && nodeDriver.IsMobyDriver() && !nodeDriver.Features(ctx)[driver.MultiPlatform] {
+		for _, exp := range opt.Exports {
+			if exp.Type == "image" || exp.Type == "docker" {
+				for ak := range opt.Annotations {
+					switch ak.Type {
+					case exptypes.AnnotationIndex, exptypes.AnnotationIndexDescriptor:
+						return nil, nil, errors.New("index annotations not supported for single platform export")
+					}
+				}
+			}
+		}
+	}
+
 	// fill in image exporter names from tags
 	if len(opt.Tags) > 0 {
 		tags := make([]string, len(opt.Tags))
@@ -233,9 +473,16 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *O
 					if err != nil {
 						return nil, nil, err
 					}
-					defers = append(defers, cancel)
+					defers = append(defers, func(error) {
+						cancel()
+					})
 					opt.Exports[i].Output = func(_ map[string]string) (io.WriteCloser, error) {
 						return w, nil
+					}
+					// if docker is using the containerd snapshotter, prefer to export the image digest
+					// (rather than the image config digest). See https://github.com/moby/moby/issues/45458.
+					if features[dockerutil.OCIImporter] {
+						opt.Exports[i].Attrs["prefer-image-digest"] = "true"
 					}
 				}
 			} else if !nodeDriver.Features(ctx)[driver.DockerExporter] {
@@ -263,15 +510,36 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *O
 	so.Exports = opt.Exports
 	so.Session = slices.Clone(opt.Session)
 
+	for k, v := range opt.BuildArgs {
+		so.FrontendAttrs["build-arg:"+k] = v
+	}
+	for k, v := range opt.Labels {
+		so.FrontendAttrs["label:"+k] = v
+	}
+
 	releaseLoad, err := loadInputs(ctx, nodeDriver, &opt.Inputs, pw, &so)
 	if err != nil {
 		return nil, nil, err
 	}
-	defers = append(defers, releaseLoad)
+	defers = append(defers, func(error) {
+		releaseLoad()
+	})
+
+	policyDefers, err := configureSourcePolicy(ctx, np, opt, cfg, bopts, &so, pw)
+	if err != nil {
+		return nil, nil, err
+	}
+	defers = append(defers, policyDefers...)
 
 	// add node identifier to shared key if one was specified
+	nodeID := cfg.TryNodeIdentifier()
 	if so.SharedKey != "" {
-		so.SharedKey += ":" + cfg.TryNodeIdentifier()
+		so.SharedKey += ":" + nodeID
+	}
+	for k, v := range so.FrontendAttrs {
+		if strings.HasPrefix(k, "sharedkey:localdir:") {
+			so.FrontendAttrs[k] = v + ":" + nodeID
+		}
 	}
 
 	if opt.Pull {
@@ -289,15 +557,9 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *O
 	if opt.NoCache {
 		so.FrontendAttrs["no-cache"] = ""
 	}
-	for k, v := range opt.BuildArgs {
-		so.FrontendAttrs["build-arg:"+k] = v
-	}
-	for k, v := range opt.Labels {
-		so.FrontendAttrs["label:"+k] = v
-	}
 
 	for k, v := range node.ProxyConfig {
-		if _, ok := opt.BuildArgs[k]; !ok {
+		if !proxyArgKeyExists(opt.BuildArgs, k) {
 			so.FrontendAttrs["build-arg:"+k] = v
 		}
 	}
@@ -318,7 +580,7 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *O
 	switch opt.NetworkMode {
 	case "host":
 		so.FrontendAttrs["force-network-mode"] = opt.NetworkMode
-		so.AllowedEntitlements = append(so.AllowedEntitlements, entitlements.EntitlementNetworkHost)
+		so.AllowedEntitlements = append(so.AllowedEntitlements, entitlements.EntitlementNetworkHost.String())
 	case "none":
 		so.FrontendAttrs["force-network-mode"] = opt.NetworkMode
 	case "", "default":
@@ -356,6 +618,147 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *O
 	return &so, releaseF, nil
 }
 
+func proxyArgKeyExists(buildArgs map[string]string, key string) bool {
+	for k := range buildArgs {
+		if strings.EqualFold(k, key) {
+			return true
+		}
+	}
+	return false
+}
+
+func configureSourcePolicy(ctx context.Context, np *noderesolver.ResolvedNode, opt *Options, cfg *confutil.Config, bopts gateway.BuildOpts, so *client.SolveOpt, pw progress.Writer) (defers []func(error), err error) {
+	if opt.Inputs.policy == nil {
+		if len(opt.Policy) > 0 {
+			return nil, errors.New("policy file specified but no policy FS in build context")
+		}
+		so.SourcePolicyProvider = nil
+		return nil, nil
+	}
+
+	env := policy.Env{}
+	for k, v := range opt.BuildArgs {
+		if env.Args == nil {
+			env.Args = map[string]*string{}
+		}
+		env.Args[k] = &v
+	}
+	env.Filename = policyEnvFilename(opt.Inputs)
+	env.Target = opt.Target
+	env.Labels = opt.Labels
+
+	popts, err := withPolicyConfig(*opt.Inputs.policy, opt.Policy)
+	if err != nil {
+		return nil, err
+	}
+
+	// Prepend the builtin default policy when enabled and not explicitly
+	// disabled. The default policy verifies trust for Docker-managed images
+	// (docker/dockerfile, docker/dockerfile-upstream) that may be implicitly
+	// loaded during a build, and passes through any other source so user
+	// policies retain full control.
+	if defaultPolicyEnabled() && !policyExplicitlyDisabled(opt.Policy) {
+		builtin := policyOpt{
+			Files: []policyFileSpec{{
+				Filename: policy.DefaultPolicyFilename,
+				Data:     policy.DefaultPolicyData(),
+			}},
+		}
+		popts = append([]policyOpt{builtin}, popts...)
+	}
+
+	if len(popts) == 0 {
+		so.SourcePolicyProvider = nil
+		return nil, nil
+	}
+
+	c, err := np.Client(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sourceResolver := sourcemeta.NewResolver(c, sourcemeta.WithProgressWriter(pw), sourcemeta.WithSession(so.Session))
+	defers = []func(error){
+		func(error) {
+			_ = sourceResolver.Close()
+		},
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		for _, f := range defers {
+			f(err)
+		}
+		defers = nil
+	}()
+
+	loadedOpts, err := resolvePolicyOpts(ctx, popts, sourceResolver)
+	if err != nil {
+		return nil, err
+	}
+	var policyFiles []string
+	for _, popt := range loadedOpts {
+		for _, f := range popt.Files {
+			if f.Filename != "" {
+				policyFiles = append(policyFiles, f.Filename)
+			}
+		}
+	}
+	var policyLogger *policyProgressLogger
+	if len(policyFiles) > 0 {
+		policyLogger = newPolicyProgressLogger(pw, fmt.Sprintf("loading policies %s", strings.Join(policyFiles, ", ")))
+	}
+	var policies []*policy.Policy
+	if policyLogger != nil {
+		defers = append(defers, func(inErr error) {
+			if len(policysession.DenyMessages(inErr)) > 0 || isPolicyEvaluationError(policies, inErr) {
+				policyLogger.Close(inErr)
+				return
+			}
+			policyLogger.Close(nil)
+		})
+	}
+	var cbs []policysession.PolicyCallback
+	for _, popt := range loadedOpts {
+		policyLevel := logrus.GetLevel()
+		if popt.LogLevel != nil {
+			policyLevel = *popt.LogLevel
+		}
+		logf := func(level logrus.Level, msg string) {
+			if policyLogger == nil || level > policyLevel {
+				return
+			}
+			policyLogger.Log(msg)
+		}
+		p := policy.NewPolicy(policy.Opt{
+			Files:            popt.Files,
+			Env:              env,
+			Log:              logf,
+			FS:               popt.FS,
+			VerifierProvider: policy.SignatureVerifier(cfg),
+			DefaultPlatform:  defaultPlatform(bopts),
+			SourceResolver:   sourceResolver,
+		})
+		policies = append(policies, p)
+		cbs = append(cbs, p.CheckPolicy)
+		if popt.Strict {
+			if bopts.LLBCaps.Supports(pb.CapSourcePolicySession) != nil {
+				return nil, errors.New("strict policy is not supported by the current BuildKit daemon, please upgrade to version v0.27+")
+			}
+		}
+	}
+	so.SourcePolicyProvider = policysession.NewPolicyProvider(policy.MultiPolicyCallback(cbs...))
+	return defers, nil
+}
+
+func policyEnvFilename(inp Inputs) string {
+	base := filepath.Base(filepath.Clean(inp.DockerfilePath))
+	if base != "." && base != string(filepath.Separator) {
+		return base
+	}
+	return "Dockerfile"
+}
+
 func loadInputs(ctx context.Context, d *driver.DriverHandle, inp *Inputs, pw progress.Writer, target *client.SolveOpt) (func(), error) {
 	if inp.ContextPath == "" {
 		return nil, errors.New("please specify build context (e.g. \".\" for the current directory)")
@@ -366,19 +769,27 @@ func loadInputs(ctx context.Context, d *driver.DriverHandle, inp *Inputs, pw pro
 	var (
 		err               error
 		dockerfileReader  io.ReadCloser
+		contextDir        string
+		remoteContext     bool
+		remotePolicyState *llb.State
 		dockerfileDir     string
 		dockerfileName    = inp.DockerfilePath
 		dockerfileSrcName = inp.DockerfilePath
 		toRemove          []string
+		caps              = map[string]struct{}{}
 	)
 
 	switch {
 	case inp.ContextState != nil:
+		remotePolicyState = inp.ContextState
 		if target.FrontendInputs == nil {
 			target.FrontendInputs = make(map[string]llb.State)
 		}
 		target.FrontendInputs["context"] = *inp.ContextState
 		target.FrontendInputs["dockerfile"] = *inp.ContextState
+		if _, ok, _ := dfgitutil.ParseGitRef(inp.ContextPath); ok {
+			target.FrontendAttrs["input:context"] = inp.ContextPath
+		}
 	case inp.ContextPath == "-":
 		if inp.DockerfilePath == "-" {
 			return nil, errors.Errorf("invalid argument: can't use stdin for both build context and dockerfile")
@@ -389,7 +800,7 @@ func loadInputs(ctx context.Context, d *driver.DriverHandle, inp *Inputs, pw pro
 		if err != nil && err != io.EOF {
 			return nil, errors.Wrap(err, "failed to peek context header from STDIN")
 		}
-		if !(err == io.EOF && len(magic) == 0) {
+		if err != io.EOF || len(magic) != 0 {
 			if isArchive(magic) {
 				// stdin is context
 				up := uploadprovider.New()
@@ -406,12 +817,14 @@ func loadInputs(ctx context.Context, d *driver.DriverHandle, inp *Inputs, pw pro
 				if err := setLocalMount("context", inp.ContextPath, target); err != nil {
 					return nil, err
 				}
+				contextDir = inp.ContextPath
 			}
 		}
 	case osutil.IsLocalDir(inp.ContextPath):
 		if err := setLocalMount("context", inp.ContextPath, target); err != nil {
 			return nil, err
 		}
+		contextDir = inp.ContextPath
 		sharedKey := inp.ContextPath
 		if p, err := filepath.Abs(sharedKey); err == nil {
 			sharedKey = filepath.Base(p)
@@ -426,7 +839,8 @@ func loadInputs(ctx context.Context, d *driver.DriverHandle, inp *Inputs, pw pro
 			dockerfileDir = filepath.Dir(inp.DockerfilePath)
 			dockerfileName = filepath.Base(inp.DockerfilePath)
 		}
-	case IsRemoteURL(inp.ContextPath):
+	case urlutil.IsRemoteURL(inp.ContextPath):
+		remoteContext = true
 		if inp.DockerfilePath == "-" {
 			dockerfileReader = inp.InStream.NewReadCloser()
 		} else if filepath.IsAbs(inp.DockerfilePath) {
@@ -435,6 +849,17 @@ func loadInputs(ctx context.Context, d *driver.DriverHandle, inp *Inputs, pw pro
 			target.FrontendAttrs["dockerfilekey"] = "dockerfile"
 		}
 		target.FrontendAttrs["context"] = inp.ContextPath
+
+		if err := processGitURL(inp.ContextPath, "context", target, caps); err != nil {
+			return nil, err
+		}
+		if st, ok := target.FrontendInputs["context"]; ok {
+			remotePolicyState = &st
+			if dockerfileReader == nil && !filepath.IsAbs(inp.DockerfilePath) {
+				target.FrontendInputs["dockerfile"] = st
+			}
+		}
+
 	default:
 		return nil, errors.Errorf("unable to prepare context: path %q not found", inp.ContextPath)
 	}
@@ -457,7 +882,7 @@ func loadInputs(ctx context.Context, d *driver.DriverHandle, inp *Inputs, pw pro
 		dockerfileName = "Dockerfile"
 		target.FrontendAttrs["dockerfilekey"] = "dockerfile"
 	}
-	if isHTTPURL(inp.DockerfilePath) {
+	if urlutil.IsHTTPURL(inp.DockerfilePath) {
 		dockerfileDir, err = createTempDockerfileFromURL(ctx, d, inp.DockerfilePath, pw)
 		if err != nil {
 			return nil, err
@@ -472,19 +897,55 @@ func loadInputs(ctx context.Context, d *driver.DriverHandle, inp *Inputs, pw pro
 		dockerfileName = "Dockerfile"
 	}
 
+	p := &policyOpt{
+		ContextDir: contextDir,
+	}
+	p.ContextState = remotePolicyState
+	if p.ContextState == nil && remoteContext {
+		p.ContextState = resolveRemotePolicyContextState(inp.ContextPath, target)
+	}
+
 	if dockerfileDir != "" {
 		if err := setLocalMount("dockerfile", dockerfileDir, target); err != nil {
 			return nil, err
 		}
 		dockerfileName = handleLowercaseDockerfile(dockerfileDir, dockerfileName)
 	}
+	defaultPolicyFilename := dockerfileName + ".rego"
+	if dockerfileDir != "" {
+		defaultPolicyFilename = filepath.Join(dockerfileDir, defaultPolicyFilename)
+	}
+	defaultPolicy := policyFileSpec{
+		Filename: defaultPolicyFilename,
+		Optional: true,
+	}
+	includeDefaultPolicy := true
+	if dockerfileDir != "" && p.ContextState == nil {
+		dt, err := os.ReadFile(defaultPolicyFilename)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return nil, errors.Wrapf(err, "failed to read policy file %s", defaultPolicyFilename)
+			}
+			includeDefaultPolicy = false
+		} else {
+			defaultPolicy.Data = dt
+		}
+	}
+	if includeDefaultPolicy {
+		p.Files = append(p.Files, defaultPolicy)
+	}
+
+	inp.policy = p
 
 	target.FrontendAttrs["filename"] = dockerfileName
 
 	for k, v := range inp.NamedContexts {
-		target.FrontendAttrs["frontend.caps"] = "moby.buildkit.frontend.contexts+forward"
+		caps["moby.buildkit.frontend.contexts+forward"] = struct{}{}
 		if v.State != nil {
 			target.FrontendAttrs["context:"+k] = "input:" + k
+			if _, ok, _ := dfgitutil.ParseGitRef(v.Path); ok {
+				target.FrontendAttrs["input:git_state_"+k] = v.Path
+			}
 			if target.FrontendInputs == nil {
 				target.FrontendInputs = make(map[string]llb.State)
 			}
@@ -492,38 +953,43 @@ func loadInputs(ctx context.Context, d *driver.DriverHandle, inp *Inputs, pw pro
 			continue
 		}
 
-		if IsRemoteURL(v.Path) || strings.HasPrefix(v.Path, "docker-image://") || strings.HasPrefix(v.Path, "target:") {
+		if urlutil.IsRemoteURL(v.Path) || strings.HasPrefix(v.Path, "docker-image://") || strings.HasPrefix(v.Path, "target:") {
 			target.FrontendAttrs["context:"+k] = v.Path
+			processGitURL(v.Path, "context:"+k, target, caps)
 			continue
 		}
 
 		// handle OCI layout
-		if strings.HasPrefix(v.Path, "oci-layout://") {
-			localPath := strings.TrimPrefix(v.Path, "oci-layout://")
-			localPath, dig, hasDigest := strings.Cut(localPath, "@")
-			localPath, tag, hasTag := strings.Cut(localPath, ":")
-			if !hasTag {
-				tag = "latest"
+		if ref, ok, err := ocilayout.Parse(v.Path); ok {
+			if err != nil {
+				return nil, err
 			}
-			if !hasDigest {
-				dig, err = resolveDigest(localPath, tag)
+			localPath := ref.Path
+
+			if ref.Digest == "" {
+				dig, err := resolveDigest(localPath, ref.Tag)
 				if err != nil {
 					return nil, errors.Wrapf(err, "oci-layout reference %q could not be resolved", v.Path)
 				}
+				ref.Digest = digest.Digest(dig)
 			}
+
 			store, err := local.NewStore(localPath)
 			if err != nil {
 				return nil, errors.Wrapf(err, "invalid store at %s", localPath)
 			}
+
 			storeName := identity.NewID()
 			if target.OCIStores == nil {
 				target.OCIStores = map[string]content.Store{}
 			}
 			target.OCIStores[storeName] = store
 
-			target.FrontendAttrs["context:"+k] = "oci-layout://" + storeName + ":" + tag + "@" + dig
+			ref.Path = storeName
+			target.FrontendAttrs["context:"+k] = ref.String()
 			continue
 		}
+
 		st, err := os.Stat(v.Path)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to get build context %v", k)
@@ -539,6 +1005,13 @@ func loadInputs(ctx context.Context, d *driver.DriverHandle, inp *Inputs, pw pro
 			return nil, err
 		}
 		target.FrontendAttrs["context:"+k] = "local:" + localName
+		sharedKey := v.Path
+		if p, err := filepath.Abs(sharedKey); err == nil {
+			sharedKey = filepath.Base(p)
+		} else {
+			sharedKey = filepath.Base(sharedKey)
+		}
+		target.FrontendAttrs["sharedkey:localdir:"+k] = sharedKey
 	}
 
 	release := func() {
@@ -547,9 +1020,37 @@ func loadInputs(ctx context.Context, d *driver.DriverHandle, inp *Inputs, pw pro
 		}
 	}
 
+	if len(caps) > 0 {
+		keys := slices.Collect(maps.Keys(caps))
+		slices.Sort(keys)
+		target.FrontendAttrs["frontend.caps"] = strings.Join(keys, ",")
+	}
+
 	inp.DockerfileMappingSrc = dockerfileSrcName
 	inp.DockerfileMappingDst = dockerfileName
 	return release, nil
+}
+
+func resolveRemotePolicyContextState(contextPath string, target *client.SolveOpt) *llb.State {
+	if target != nil && target.FrontendInputs != nil {
+		if st, ok := target.FrontendInputs["context"]; ok {
+			return &st
+		}
+	}
+
+	keepGitDir := false
+	if st, ok, _ := dockerui.DetectGitContext(contextPath, &keepGitDir); ok {
+		return st
+	}
+
+	st, filename, ok := dockerui.DetectHTTPContext(contextPath)
+	if !ok || filename == "" {
+		return nil
+	}
+	bc := llb.Scratch().File(llb.Copy(*st, filename, "/", &llb.CopyInfo{
+		AttemptUnpack: true,
+	}))
+	return &bc
 }
 
 func resolveDigest(localPath, tag string) (dig string, _ error) {
@@ -588,7 +1089,7 @@ func setLocalMount(name, dir string, so *client.SolveOpt) error {
 	if so.LocalMounts == nil {
 		so.LocalMounts = map[string]fsutil.FS{}
 	}
-	so.LocalMounts[name] = &fs{FS: lm, dir: dir}
+	so.LocalMounts[name] = &fsMount{FS: lm, dir: dir}
 	return nil
 }
 
@@ -616,6 +1117,57 @@ func createTempDockerfile(r io.Reader, multiReader *SyncMultiReader) (string, er
 		return "", err
 	}
 	return dir, err
+}
+
+func processGitURL(url string, name string, target *client.SolveOpt, caps map[string]struct{}) error {
+	gitRef, err := gitutil.ParseURL(url)
+	if err != nil {
+		return err
+	}
+	if len(gitRef.Query) == 0 {
+		return nil
+	}
+	if !sendGitQueryAsInput() {
+		capName := "moby.buildkit.frontend.gitquerystring"
+		if name != "context" {
+			capName += "+forward"
+		}
+		caps[capName] = struct{}{}
+		return nil
+	}
+
+	var keepGitDir *bool
+	if name == "context" {
+		if v, ok := target.FrontendAttrs["build-arg:BUILDKIT_CONTEXT_KEEP_GIT_DIR"]; ok {
+			if vv, err := strconv.ParseBool(v); err == nil {
+				keepGitDir = &vv
+			}
+		}
+	}
+
+	st, ok, err := dockerui.DetectGitContext(url, keepGitDir)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+
+	if target.FrontendInputs == nil {
+		target.FrontendInputs = make(map[string]llb.State)
+	}
+	if name == "context" {
+		target.FrontendInputs["context"] = *st
+		delete(target.FrontendAttrs, "context")
+		target.FrontendAttrs["input:context"] = url
+	} else {
+		inputName := "git_state_" + name
+		target.FrontendInputs[inputName] = *st
+		target.FrontendAttrs[name] = "input:" + inputName
+		target.FrontendAttrs["input:"+name] = url
+	}
+
+	return nil
 }
 
 // handle https://github.com/moby/moby/pull/10858
@@ -649,9 +1201,268 @@ func handleLowercaseDockerfile(dir, p string) string {
 	return p
 }
 
-type fs struct {
+type fsMount struct {
 	fsutil.FS
 	dir string
 }
 
-var _ fsutil.FS = &fs{}
+var _ fsutil.FS = &fsMount{}
+
+func CreateSSH(ssh []*buildflags.SSH) (session.Attachable, error) {
+	configs := make([]sshprovider.AgentConfig, 0, len(ssh))
+	for _, ssh := range ssh {
+		cfg := sshprovider.AgentConfig{
+			ID:    ssh.ID,
+			Paths: slices.Clone(ssh.Paths),
+		}
+		configs = append(configs, cfg)
+	}
+	return sshprovider.NewSSHAgentProvider(configs)
+}
+
+func CreateSecrets(secrets []*buildflags.Secret) (session.Attachable, error) {
+	fs := make([]secretsprovider.Source, 0, len(secrets))
+	for _, secret := range secrets {
+		fs = append(fs, secretsprovider.Source{
+			ID:       secret.ID,
+			FilePath: secret.FilePath,
+			Env:      secret.Env,
+		})
+	}
+	store, err := secretsprovider.NewStore(fs)
+	if err != nil {
+		return nil, err
+	}
+	return secretsprovider.NewSecretProvider(store), nil
+}
+
+func CreateExports(entries []*buildflags.ExportEntry) ([]client.ExportEntry, []string, error) {
+	var outs []client.ExportEntry
+	var localPaths []string
+	if len(entries) == 0 {
+		return nil, nil, nil
+	}
+	var stdoutUsed bool
+	for _, entry := range entries {
+		if entry.Type == "" {
+			return nil, nil, errors.Errorf("type is required for output")
+		}
+
+		out := client.ExportEntry{
+			Type:  entry.Type,
+			Attrs: map[string]string{},
+		}
+		maps.Copy(out.Attrs, entry.Attrs)
+
+		supportFile := false
+		supportDir := false
+		switch out.Type {
+		case client.ExporterLocal:
+			supportDir = true
+		case client.ExporterTar:
+			supportFile = true
+		case client.ExporterOCI, client.ExporterDocker:
+			tar, err := strconv.ParseBool(out.Attrs["tar"])
+			if err != nil {
+				tar = true
+			}
+			supportFile = tar
+			supportDir = !tar
+		case "registry":
+			out.Type = client.ExporterImage
+			out.Attrs["push"] = "true"
+			// Skip unpacking when only pushing to registry (unless explicitly set)
+			if _, ok := out.Attrs["unpack"]; !ok {
+				out.Attrs["unpack"] = "false"
+			}
+		}
+
+		if supportDir {
+			if entry.Destination == "" {
+				return nil, nil, errors.Errorf("dest is required for %s exporter", out.Type)
+			}
+			if entry.Destination == "-" {
+				return nil, nil, errors.Errorf("dest cannot be stdout for %s exporter", out.Type)
+			}
+
+			fi, err := os.Stat(entry.Destination)
+			if err != nil && !os.IsNotExist(err) {
+				return nil, nil, errors.Wrapf(err, "invalid destination directory: %s", entry.Destination)
+			}
+			if err == nil && !fi.IsDir() {
+				return nil, nil, errors.Errorf("destination directory %s is a file", entry.Destination)
+			}
+			out.OutputDir = entry.Destination
+			localPaths = append(localPaths, entry.Destination)
+		}
+		if supportFile {
+			if entry.Destination == "" && out.Type != client.ExporterDocker {
+				entry.Destination = "-"
+			}
+			if entry.Destination == "-" {
+				if stdoutUsed {
+					return nil, nil, errors.Errorf("multiple outputs configured to write to stdout")
+				}
+				if _, err := console.ConsoleFromFile(os.Stdout); err == nil {
+					return nil, nil, errors.Errorf("dest file is required for %s exporter. refusing to write to console", out.Type)
+				}
+				out.Output = wrapWriteCloser(os.Stdout)
+				stdoutUsed = true
+			} else if entry.Destination != "" {
+				fi, err := os.Stat(entry.Destination)
+				if err != nil && !os.IsNotExist(err) {
+					return nil, nil, errors.Wrapf(err, "invalid destination file: %s", entry.Destination)
+				}
+				if err == nil && fi.IsDir() {
+					return nil, nil, errors.Errorf("destination file %s is a directory", entry.Destination)
+				}
+				out.Output = wrapWriteCloserLazy(entry.Destination)
+				localPaths = append(localPaths, entry.Destination)
+			}
+		}
+
+		outs = append(outs, out)
+	}
+	return outs, localPaths, nil
+}
+
+func wrapWriteCloser(wc io.WriteCloser) func(map[string]string) (io.WriteCloser, error) {
+	return func(map[string]string) (io.WriteCloser, error) {
+		return wc, nil
+	}
+}
+
+type lazyFileWriter struct {
+	path string
+	file *os.File
+}
+
+func (w *lazyFileWriter) Write(p []byte) (int, error) {
+	if w.file == nil {
+		if err := os.MkdirAll(filepath.Dir(w.path), 0o755); err != nil {
+			return 0, err
+		}
+		f, err := os.Create(w.path)
+		if err != nil {
+			return 0, err
+		}
+		w.file = f
+	}
+	return w.file.Write(p)
+}
+
+func (w *lazyFileWriter) Close() error {
+	if w.file != nil {
+		return w.file.Close()
+	}
+	return nil
+}
+
+func wrapWriteCloserLazy(path string) func(map[string]string) (io.WriteCloser, error) {
+	return func(map[string]string) (io.WriteCloser, error) {
+		return &lazyFileWriter{path: path}, nil
+	}
+}
+
+func CreateCaches(entries []*buildflags.CacheOptionsEntry) []client.CacheOptionsEntry {
+	var outs []client.CacheOptionsEntry
+	if len(entries) == 0 {
+		return nil
+	}
+
+	for _, entry := range entries {
+		out := client.CacheOptionsEntry{
+			Type:  entry.Type,
+			Attrs: map[string]string{},
+		}
+		maps.Copy(out.Attrs, entry.Attrs)
+		addGithubToken(&out)
+		addAwsCredentials(&out)
+		if !isActive(&out) {
+			continue
+		}
+		outs = append(outs, out)
+	}
+	return outs
+}
+
+func addGithubToken(ci *client.CacheOptionsEntry) {
+	if ci.Type != "gha" {
+		return
+	}
+	version, ok := ci.Attrs["version"]
+	if !ok {
+		// https://github.com/actions/toolkit/blob/2b08dc18f261b9fdd978b70279b85cbef81af8bc/packages/cache/src/internal/config.ts#L19
+		if v, ok := os.LookupEnv("ACTIONS_CACHE_SERVICE_V2"); ok {
+			if b, err := strconv.ParseBool(v); err == nil && b {
+				version = "2"
+			}
+		}
+	}
+	if _, ok := ci.Attrs["token"]; !ok {
+		if v, ok := os.LookupEnv("ACTIONS_RUNTIME_TOKEN"); ok {
+			ci.Attrs["token"] = v
+		}
+	}
+	if _, ok := ci.Attrs["url_v2"]; !ok && version == "2" {
+		// https://github.com/actions/toolkit/blob/2b08dc18f261b9fdd978b70279b85cbef81af8bc/packages/cache/src/internal/config.ts#L34-L35
+		if v, ok := os.LookupEnv("ACTIONS_RESULTS_URL"); ok {
+			ci.Attrs["url_v2"] = v
+		}
+	}
+	if _, ok := ci.Attrs["url"]; !ok {
+		// https://github.com/actions/toolkit/blob/2b08dc18f261b9fdd978b70279b85cbef81af8bc/packages/cache/src/internal/config.ts#L28-L33
+		if v, ok := os.LookupEnv("ACTIONS_CACHE_URL"); ok {
+			ci.Attrs["url"] = v
+		} else if v, ok := os.LookupEnv("ACTIONS_RESULTS_URL"); ok {
+			ci.Attrs["url"] = v
+		}
+	}
+}
+
+func addAwsCredentials(ci *client.CacheOptionsEntry) {
+	if ci.Type != "s3" {
+		return
+	}
+	_, okAccessKeyID := ci.Attrs["access_key_id"]
+	_, okSecretAccessKey := ci.Attrs["secret_access_key"]
+	// If the user provides access_key_id, secret_access_key, do not override the session token.
+	if okAccessKeyID && okSecretAccessKey {
+		return
+	}
+	ctx := context.TODO()
+	awsConfig, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		return
+	}
+	credentials, err := awsConfig.Credentials.Retrieve(ctx)
+	if err != nil {
+		return
+	}
+	if !okAccessKeyID && credentials.AccessKeyID != "" {
+		ci.Attrs["access_key_id"] = credentials.AccessKeyID
+	}
+	if !okSecretAccessKey && credentials.SecretAccessKey != "" {
+		ci.Attrs["secret_access_key"] = credentials.SecretAccessKey
+	}
+	if _, ok := ci.Attrs["session_token"]; !ok && credentials.SessionToken != "" {
+		ci.Attrs["session_token"] = credentials.SessionToken
+	}
+}
+
+func isActive(ce *client.CacheOptionsEntry) bool {
+	// Always active if not gha.
+	if ce.Type != "gha" {
+		return true
+	}
+	return ce.Attrs["token"] != "" && (ce.Attrs["url"] != "" || ce.Attrs["url_v2"] != "")
+}
+
+func defaultPlatform(bopts gateway.BuildOpts) *ocispecs.Platform {
+	pl := bopts.Workers[0].Platforms
+	if len(pl) == 0 {
+		return nil
+	}
+	p := platforms.Normalize(pl[0])
+	return &p
+}

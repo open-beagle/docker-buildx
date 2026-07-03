@@ -2,12 +2,11 @@ package history
 
 import (
 	"context"
+	stderrors "errors"
 	"io"
 
-	"github.com/docker/buildx/builder"
 	"github.com/docker/buildx/util/cobrautil/completion"
 	"github.com/docker/cli/cli/command"
-	"github.com/hashicorp/go-multierror"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -21,19 +20,9 @@ type rmOptions struct {
 }
 
 func runRm(ctx context.Context, dockerCli command.Cli, opts rmOptions) error {
-	b, err := builder.New(dockerCli, builder.WithName(opts.builder))
+	nodes, err := loadNodes(ctx, dockerCli, opts.builder)
 	if err != nil {
 		return err
-	}
-
-	nodes, err := b.LoadNodes(ctx)
-	if err != nil {
-		return err
-	}
-	for _, node := range nodes {
-		if node.Err != nil {
-			return node.Err
-		}
 	}
 
 	errs := make([][]error, len(opts.refs))
@@ -43,7 +32,6 @@ func runRm(ctx context.Context, dockerCli command.Cli, opts rmOptions) error {
 
 	eg, ctx := errgroup.WithContext(ctx)
 	for i, node := range nodes {
-		node := node
 		eg.Go(func() error {
 			if node.Driver == nil {
 				return nil
@@ -102,26 +90,18 @@ func runRm(ctx context.Context, dockerCli command.Cli, opts rmOptions) error {
 	var out []error
 loop0:
 	for _, nodeErrs := range errs {
-		var nodeErr error
+		var nodeErr []error
 		for _, err1 := range nodeErrs {
 			if err1 == nil {
 				continue loop0
 			}
-			if nodeErr == nil {
-				nodeErr = err1
-			} else {
-				nodeErr = multierror.Append(nodeErr, err1)
-			}
+			nodeErr = append(nodeErr, err1)
 		}
-		out = append(out, nodeErr)
+		if len(nodeErr) > 0 {
+			out = append(out, stderrors.Join(nodeErr...))
+		}
 	}
-	if len(out) == 0 {
-		return nil
-	}
-	if len(out) == 1 {
-		return out[0]
-	}
-	return multierror.Append(out[0], out[1:]...)
+	return stderrors.Join(out...)
 }
 
 func rmCmd(dockerCli command.Cli, rootOpts RootOptions) *cobra.Command {
@@ -141,7 +121,8 @@ func rmCmd(dockerCli command.Cli, rootOpts RootOptions) *cobra.Command {
 			options.builder = *rootOpts.Builder
 			return runRm(cmd.Context(), dockerCli, options)
 		},
-		ValidArgsFunction: completion.Disable,
+		ValidArgsFunction:     completion.Disable,
+		DisableFlagsInUseLine: true,
 	}
 
 	flags := cmd.Flags()

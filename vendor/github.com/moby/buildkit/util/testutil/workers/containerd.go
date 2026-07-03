@@ -25,8 +25,8 @@ func InitContainerdWorker() {
 	// defined in Dockerfile
 	// e.g. `containerd-1.1=/opt/containerd-1.1/bin,containerd-42.0=/opt/containerd-42.0/bin`
 	if s := os.Getenv("BUILDKIT_INTEGRATION_CONTAINERD_EXTRA"); s != "" {
-		entries := strings.Split(s, ",")
-		for _, entry := range entries {
+		entries := strings.SplitSeq(s, ",")
+		for entry := range entries {
 			pair := strings.Split(strings.TrimSpace(entry), "=")
 			if len(pair) != 2 {
 				panic(errors.Errorf("unexpected BUILDKIT_INTEGRATION_CONTAINERD_EXTRA: %q", s))
@@ -191,7 +191,7 @@ disabled_plugins = ["io.containerd.grpc.v1.cri"]
 		}, c.ExtraEnv...), "containerd-rootless.sh", "-c", configFile)
 	}
 
-	cmd := exec.Command(containerdArgs[0], containerdArgs[1:]...) //nolint:gosec // test utility
+	cmd := exec.CommandContext(context.TODO(), containerdArgs[0], containerdArgs[1:]...) //nolint:gosec // test utility
 	cmd.Env = append(os.Environ(), c.ExtraEnv...)
 
 	ctdStop, err := integration.StartCmd(cmd, cfg.Logs)
@@ -278,7 +278,7 @@ func runStargzSnapshotter(cfg *integration.BackendConfig) (address string, cl fu
 
 	address = filepath.Join(tmpStargzDir, "containerd-stargz-grpc.sock")
 	stargzRootDir := filepath.Join(tmpStargzDir, "root")
-	cmd := exec.Command(binary,
+	cmd := exec.CommandContext(context.TODO(), binary,
 		"--log-level", "debug",
 		"--address", address,
 		"--root", stargzRootDir)

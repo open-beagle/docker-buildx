@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,8 +50,8 @@ func withDir(dir string) cmdOpt {
 }
 
 func buildxCmd(sb integration.Sandbox, opts ...cmdOpt) *exec.Cmd {
-	cmd := exec.Command("buildx")
-	cmd.Env = append([]string{}, os.Environ()...)
+	cmd := exec.CommandContext(context.TODO(), "buildx")
+	cmd.Env = os.Environ()
 	for _, opt := range opts {
 		opt(cmd)
 	}
@@ -75,9 +76,35 @@ func buildxCmd(sb integration.Sandbox, opts ...cmdOpt) *exec.Cmd {
 	return cmd
 }
 
+func composeCmd(sb integration.Sandbox, opts ...cmdOpt) *exec.Cmd {
+	cmd := exec.CommandContext(context.TODO(), "compose")
+	cmd.Env = os.Environ()
+	for _, opt := range opts {
+		opt(cmd)
+	}
+
+	builder := sb.Address()
+	context := sb.DockerAddress()
+	if builder != "" && builder != context {
+		cmd.Env = append(cmd.Env,
+			"BUILDX_CONFIG="+buildxConfig(sb),
+			"BUILDX_BUILDER="+builder,
+		)
+	}
+	if context != "" {
+		cmd.Env = append(cmd.Env, "DOCKER_CONTEXT="+context)
+	}
+	if v := os.Getenv("GO_TEST_COVERPROFILE"); v != "" {
+		coverDir := filepath.Join(filepath.Dir(v), "helpers")
+		cmd.Env = append(cmd.Env, "GOCOVERDIR="+coverDir)
+	}
+	cmd.Env = append(cmd.Env, "COMPOSE_BAKE=true")
+	return cmd
+}
+
 func dockerCmd(sb integration.Sandbox, opts ...cmdOpt) *exec.Cmd {
-	cmd := exec.Command("docker")
-	cmd.Env = append([]string{}, os.Environ()...)
+	cmd := exec.CommandContext(context.TODO(), "docker")
+	cmd.Env = os.Environ()
 	for _, opt := range opts {
 		opt(cmd)
 	}
@@ -112,6 +139,15 @@ func isDockerWorker(sb integration.Sandbox) bool {
 func isDockerContainerWorker(sb integration.Sandbox) bool {
 	name, _, _ := driverName(sb.Name())
 	return name == "docker-container"
+}
+
+func isRemoteWorker(sb integration.Sandbox) bool {
+	name, _, _ := driverName(sb.Name())
+	return name == "remote"
+}
+
+func isRemoteMultiNodeWorker(sb integration.Sandbox) bool {
+	return sb.Name() == "remote+multinode"
 }
 
 func driverName(sbName string) (string, bool, bool) {
@@ -160,7 +196,7 @@ func buildkitVersion(t *testing.T, sb integration.Sandbox) string {
 	if !ok {
 		out, err := inspectCmd(sb, withArgs(sb.Address()))
 		require.NoError(t, err, out)
-		for _, line := range strings.Split(out, "\n") {
+		for line := range strings.SplitSeq(out, "\n") {
 			if v, ok := strings.CutPrefix(line, "BuildKit version:"); ok {
 				ver = strings.TrimSpace(v)
 				bkvers[sb.Name()] = ver
@@ -176,10 +212,10 @@ func buildkitVersion(t *testing.T, sb integration.Sandbox) string {
 				os.RemoveAll(destDir)
 			})
 
-			cmd := exec.Command(undockBin, "--cachedir", "/root/.cache/undock", "--include", "/usr/bin/buildkitd", "--rm-dist", buildkitImage, destDir)
+			cmd := exec.CommandContext(context.TODO(), undockBin, "--cachedir", "/root/.cache/undock", "--include", "/usr/bin/buildkitd", "--rm-dist", buildkitImage, destDir)
 			require.NoErrorf(t, cmd.Run(), "failed to extract buildkitd binary from %q", buildkitImage)
 
-			cmd = exec.Command(filepath.Join(destDir, "usr", "bin", "buildkitd"), "--version")
+			cmd = exec.CommandContext(context.TODO(), filepath.Join(destDir, "usr", "bin", "buildkitd"), "--version")
 			out, err := cmd.CombinedOutput()
 			require.NoErrorf(t, err, "failed to get BuildKit version from %q: %s", buildkitImage, string(out))
 
@@ -214,7 +250,7 @@ func skipNoCompatBuildKit(t *testing.T, sb integration.Sandbox, constraint strin
 	}
 }
 
-func ptrstr(s interface{}) *string {
+func ptrstr(s any) *string {
 	var n *string
 	if reflect.ValueOf(s).Kind() == reflect.String {
 		ss := s.(string)

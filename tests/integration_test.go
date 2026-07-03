@@ -14,6 +14,7 @@ func init() {
 	if bkworkers.IsTestDockerd() {
 		workers.InitDockerWorker()
 		workers.InitDockerContainerWorker()
+		workers.InitRemoteMultiNodeWorker()
 	} else {
 		workers.InitRemoteWorker()
 	}
@@ -23,7 +24,13 @@ func TestIntegration(t *testing.T) {
 	var tests []func(t *testing.T, sb integration.Sandbox)
 	tests = append(tests, commonTests...)
 	tests = append(tests, buildTests...)
+	tests = append(tests, debugTests...)
+	tests = append(tests, policyBuildTests...)
+	tests = append(tests, policyEvalTests...)
+	tests = append(tests, policyBakeTests...)
+	tests = append(tests, policyTestTests...)
 	tests = append(tests, bakeTests...)
+	tests = append(tests, historyTests...)
 	tests = append(tests, inspectTests...)
 	tests = append(tests, lsTests...)
 	tests = append(tests, imagetoolsTests...)
@@ -31,6 +38,9 @@ func TestIntegration(t *testing.T) {
 	tests = append(tests, createTests...)
 	tests = append(tests, rmTests...)
 	tests = append(tests, dialstdioTests...)
+	tests = append(tests, composeTests...)
+	tests = append(tests, diskusageTests...)
+	tests = append(tests, dapBuildTests...)
 	testIntegration(t, tests...)
 }
 
@@ -46,6 +56,7 @@ func testIntegration(t *testing.T, funcs ...func(t *testing.T, sb integration.Sa
 		}
 	}
 	mirroredImages["moby/buildkit:buildx-stable-1"] = buildkitImage
+	mirroredImages["docker/dockerfile-upstream:1.18.0"] = "docker.io/docker/dockerfile-upstream:1.18.0"
 	mirrors := integration.WithMirroredImages(mirroredImages)
 
 	tests := integration.TestFuncs(funcs...)

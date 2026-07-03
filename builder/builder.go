@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -23,7 +24,9 @@ import (
 	"github.com/docker/cli/cli/command"
 	dopts "github.com/docker/cli/opts"
 	"github.com/google/shlex"
+	buildkitdconfig "github.com/moby/buildkit/cmd/buildkitd/config"
 	"github.com/moby/buildkit/util/progress/progressui"
+	dockerclient "github.com/moby/moby/client"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 	"github.com/tonistiigi/go-csvvalue"
@@ -121,7 +124,7 @@ func New(dockerCli command.Cli, opts ...Option) (_ *Builder, err error) {
 
 // Validate validates builder context
 func (b *Builder) Validate() error {
-	if b.NodeGroup != nil && b.NodeGroup.DockerContext {
+	if b.NodeGroup != nil && b.DockerContext {
 		list, err := b.opts.dockerCli.ContextStore().List()
 		if err != nil {
 			return err
@@ -143,7 +146,7 @@ func (b *Builder) ContextName() string {
 		return ""
 	}
 	for _, cb := range ctxbuilders {
-		if b.NodeGroup.Driver == "docker" && len(b.NodeGroup.Nodes) == 1 && b.NodeGroup.Nodes[0].Endpoint == cb.Name {
+		if b.Driver == "docker" && len(b.NodeGroup.Nodes) == 1 && b.NodeGroup.Nodes[0].Endpoint == cb.Name {
 			return cb.Name
 		}
 	}
@@ -199,7 +202,7 @@ func (b *Builder) Boot(ctx context.Context) (bool, error) {
 		err = err1
 	}
 
-	if err == nil && len(errCh) == len(toBoot) {
+	if err == nil && len(errCh) > 0 {
 		return false, <-errCh
 	}
 	return true, err
@@ -246,14 +249,14 @@ func (b *Builder) Factory(ctx context.Context, dialMeta map[string][]string) (_ 
 			}
 			// check if endpoint is healthy is needed to determine the driver type.
 			// if this fails then can't continue with driver selection.
-			if _, err = dockerapi.Ping(ctx); err != nil {
+			if _, err = dockerapi.Ping(ctx, dockerclient.PingOptions{}); err != nil {
 				return
 			}
 			b.driverFactory.Factory, err = driver.GetDefaultFactory(ctx, ep, dockerapi, false, dialMeta)
 			if err != nil {
 				return
 			}
-			b.Driver = b.driverFactory.Factory.Name()
+			b.Driver = b.driverFactory.Name()
 		}
 	})
 	return b.driverFactory.Factory, err
@@ -267,7 +270,7 @@ func (b *Builder) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Name         string
 		Driver       string
-		LastActivity time.Time `json:",omitempty"`
+		LastActivity time.Time
 		Dynamic      bool
 		Nodes        []Node
 		Err          string `json:",omitempty"`
@@ -308,7 +311,7 @@ func GetBuilders(dockerCli command.Cli, txn *store.Txn) ([]*Builder, error) {
 			return nil, err
 		}
 		builders[i] = b
-		seen[b.NodeGroup.Name] = struct{}{}
+		seen[b.Name] = struct{}{}
 	}
 
 	for _, c := range contexts {
@@ -343,6 +346,7 @@ type CreateOpts struct {
 	Use                 bool
 	Endpoint            string
 	Append              bool
+	Timeout             time.Duration
 }
 
 func Create(ctx context.Context, txn *store.Txn, dockerCli command.Cli, opts CreateOpts) (*Builder, error) {
@@ -522,8 +526,10 @@ func Create(ctx context.Context, txn *store.Txn, dockerCli command.Cli, opts Cre
 		return nil, err
 	}
 
-	cancelCtx, cancel := context.WithCancelCause(ctx)
-	timeoutCtx, _ := context.WithTimeoutCause(cancelCtx, 20*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet,lostcancel // no need to manually cancel this context as we already rely on parent
+	timeoutCtx, cancel := context.WithCancelCause(ctx)
+	if opts.Timeout > 0 {
+		timeoutCtx, _ = context.WithTimeoutCause(timeoutCtx, opts.Timeout, errors.WithStack(context.DeadlineExceeded)) //nolint:govet // no need to manually cancel this context as we already rely on parent
+	}
 	defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
 	nodes, err := b.LoadNodes(timeoutCtx, WithData())
@@ -656,28 +662,16 @@ func parseBuildkitdFlags(inp string, driver string, driverOpts map[string]string
 	flags.StringArrayVar(&allowInsecureEntitlements, "allow-insecure-entitlement", nil, "")
 	_ = flags.Parse(res)
 
-	var hasNetworkHostEntitlement bool
-	for _, e := range allowInsecureEntitlements {
-		if e == "network.host" {
-			hasNetworkHostEntitlement = true
-			break
-		}
-	}
+	hasNetworkHostEntitlement := slices.Contains(allowInsecureEntitlements, "network.host")
 
 	var hasNetworkHostEntitlementInConf bool
 	if buildkitdConfigFile != "" {
-		btoml, err := confutil.LoadConfigTree(buildkitdConfigFile)
+		cfg, err := buildkitdconfig.LoadFile(buildkitdConfigFile)
 		if err != nil {
 			return nil, err
-		} else if btoml != nil {
-			if ies := btoml.GetArray("insecure-entitlements"); ies != nil {
-				for _, e := range ies.([]string) {
-					if e == "network.host" {
-						hasNetworkHostEntitlementInConf = true
-						break
-					}
-				}
-			}
+		}
+		if slices.Contains(cfg.Entitlements, "network.host") {
+			hasNetworkHostEntitlementInConf = true
 		}
 	}
 

@@ -14,10 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG GO_VERSION="1.23"
-ARG XX_VERSION="1.6.1"
-ARG GOLANGCI_LINT_VERSION="v1.62"
-ARG ADDLICENSE_VERSION="v1.1.1"
+ARG GO_VERSION="1.24"
+ARG XX_VERSION="1.9.0"
+ARG GOLANGCI_LINT_VERSION="v2.7.1"
+ARG ADDLICENSE_VERSION="v1.2.0"
 
 ARG LICENSE_ARGS="-c cli-docs-tool -l apache"
 ARG LICENSE_FILES=".*\(Dockerfile\|\.go\|\.hcl\|\.sh\)"

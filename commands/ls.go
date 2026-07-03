@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -39,6 +40,7 @@ const (
 type lsOptions struct {
 	format  string
 	noTrunc bool
+	timeout time.Duration
 }
 
 func runLs(ctx context.Context, dockerCli command.Cli, in lsOptions) error {
@@ -59,7 +61,9 @@ func runLs(ctx context.Context, dockerCli command.Cli, in lsOptions) error {
 	}
 
 	timeoutCtx, cancel := context.WithCancelCause(ctx)
-	timeoutCtx, _ = context.WithTimeoutCause(timeoutCtx, 20*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet,lostcancel // no need to manually cancel this context as we already rely on parent
+	if in.timeout > 0 {
+		timeoutCtx, _ = context.WithTimeoutCause(timeoutCtx, in.timeout, errors.WithStack(context.DeadlineExceeded)) //nolint:govet // no need to manually cancel this context as we already rely on parent
+	}
 	defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
 	eg, _ := errgroup.WithContext(timeoutCtx)
@@ -106,12 +110,14 @@ func lsCmd(dockerCli command.Cli) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runLs(cmd.Context(), dockerCli, options)
 		},
-		ValidArgsFunction: completion.Disable,
+		ValidArgsFunction:     completion.Disable,
+		DisableFlagsInUseLine: true,
 	}
 
 	flags := cmd.Flags()
 	flags.StringVar(&options.format, "format", formatter.TableFormatKey, "Format the output")
 	flags.BoolVar(&options.noTrunc, "no-trunc", false, "Don't truncate output")
+	setBuilderStatusTimeoutFlag(flags, &options.timeout)
 
 	// hide builder persistent flag for this command
 	cobrautil.HideInheritedFlags(cmd, "builder")
@@ -157,6 +163,9 @@ func lsPrint(dockerCli command.Cli, current *store.NodeGroup, builders []*builde
 				if ctx.Format.IsTable() {
 					hasErrors = true
 				}
+				continue
+			}
+			if ctx.Format.IsJSON() {
 				continue
 			}
 			for _, n := range b.Nodes() {
@@ -209,7 +218,17 @@ type lsContext struct {
 }
 
 func (c *lsContext) MarshalJSON() ([]byte, error) {
-	return json.Marshal(c.Builder)
+	// can't marshal c.Builder directly because Builder type has custom MarshalJSON
+	dt, err := json.Marshal(c.Builder.Builder)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	if err := json.Unmarshal(dt, &m); err != nil {
+		return nil, err
+	}
+	m["Current"] = c.Builder.Current
+	return json.Marshal(m)
 }
 
 func (c *lsContext) Name() string {
@@ -406,9 +425,7 @@ func truncPlatforms(pfs []string, max int) truncatedPlatforms {
 			left[ppf] = append(left[ppf], pf)
 		}
 	}
-	for k, v := range left {
-		res[k] = v
-	}
+	maps.Copy(res, left)
 	return truncatedPlatforms{
 		res:   res,
 		input: pfs,

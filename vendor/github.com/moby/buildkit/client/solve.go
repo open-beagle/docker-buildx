@@ -7,6 +7,7 @@ import (
 	"io"
 	"maps"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -24,7 +25,7 @@ import (
 	"github.com/moby/buildkit/solver/pb"
 	spb "github.com/moby/buildkit/sourcepolicy/pb"
 	"github.com/moby/buildkit/util/bklog"
-	"github.com/moby/buildkit/util/entitlements"
+	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/fsutil"
@@ -35,7 +36,8 @@ import (
 
 type SolveOpt struct {
 	Exports               []ExportEntry
-	LocalDirs             map[string]string // Deprecated: use LocalMounts
+	CompatibilityVersion  int
+	EnableSessionExporter bool
 	LocalMounts           map[string]fsutil.FS
 	OCIStores             map[string]content.Store
 	SharedKey             string
@@ -45,19 +47,21 @@ type SolveOpt struct {
 	CacheExports          []CacheOptionsEntry
 	CacheImports          []CacheOptionsEntry
 	Session               []session.Attachable
-	AllowedEntitlements   []entitlements.Entitlement
+	AllowedEntitlements   []string
 	SharedSession         *session.Session // TODO: refactor to better session syncing
 	SessionPreInitialized bool             // TODO: refactor to better session syncing
 	Internal              bool
 	SourcePolicy          *spb.Policy
+	SourcePolicyProvider  session.Attachable
 	Ref                   string
 }
 
 type ExportEntry struct {
-	Type      string
-	Attrs     map[string]string
-	Output    filesync.FileOutputFunc // for ExporterOCI and ExporterDocker
-	OutputDir string                  // for ExporterLocal
+	Type        string
+	Attrs       map[string]string
+	Output      filesync.FileOutputFunc // for ExporterOCI and ExporterDocker
+	OutputDir   string                  // for ExporterLocal
+	OutputStore content.Store
 }
 
 type CacheOptionsEntry struct {
@@ -91,11 +95,7 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 		return nil, errors.New("invalid with def and cb")
 	}
 
-	mounts, err := prepareMounts(&opt)
-	if err != nil {
-		return nil, err
-	}
-	syncedDirs, err := prepareSyncedFiles(def, mounts)
+	syncedDirs, err := prepareSyncedFiles(def, opt.LocalMounts)
 	if err != nil {
 		return nil, err
 	}
@@ -142,9 +142,7 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 		}
 
 		contentStores := map[string]content.Store{}
-		for key, store := range cacheOpt.contentStores {
-			contentStores[key] = store
-		}
+		maps.Copy(contentStores, cacheOpt.contentStores)
 		for key, store := range opt.OCIStores {
 			key2 := "oci:" + key
 			if _, ok := contentStores[key2]; ok {
@@ -155,25 +153,27 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 
 		var syncTargets []filesync.FSSyncTarget
 		for exID, ex := range opt.Exports {
-			var supportFile bool
-			var supportDir bool
+			var supportFile, supportDir, supportStore bool
 			switch ex.Type {
 			case ExporterLocal:
 				supportDir = true
 			case ExporterTar:
 				supportFile = true
 			case ExporterOCI, ExporterDocker:
-				supportDir = ex.OutputDir != ""
 				supportFile = ex.Output != nil
-			}
-			if supportFile && supportDir {
-				return nil, errors.Errorf("both file and directory output is not supported by %s exporter", ex.Type)
+				supportStore = ex.OutputStore != nil || ex.OutputDir != ""
+				if supportFile && supportStore {
+					return nil, errors.Errorf("both file and store output is not supported by %s exporter", ex.Type)
+				}
 			}
 			if !supportFile && ex.Output != nil {
 				return nil, errors.Errorf("output file writer is not supported by %s exporter", ex.Type)
 			}
-			if !supportDir && ex.OutputDir != "" {
+			if !supportDir && !supportStore && ex.OutputDir != "" {
 				return nil, errors.Errorf("output directory is not supported by %s exporter", ex.Type)
+			}
+			if !supportStore && ex.OutputStore != nil {
+				return nil, errors.Errorf("output store is not supported by %s exporter", ex.Type)
 			}
 			if supportFile {
 				if ex.Output == nil {
@@ -185,20 +185,27 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 				if ex.OutputDir == "" {
 					return nil, errors.Errorf("output directory is required for %s exporter", ex.Type)
 				}
-				switch ex.Type {
-				case ExporterOCI, ExporterDocker:
+				syncTargets = append(syncTargets, filesync.WithFSSyncDir(exID, ex.OutputDir))
+			}
+			if supportStore {
+				store := ex.OutputStore
+				if store == nil {
 					if err := os.MkdirAll(ex.OutputDir, 0755); err != nil {
 						return nil, err
 					}
-					cs, err := contentlocal.NewStore(ex.OutputDir)
+					store, err = contentlocal.NewStore(ex.OutputDir)
 					if err != nil {
 						return nil, err
 					}
-					contentStores["export"] = cs
 					storesToUpdate = append(storesToUpdate, ex.OutputDir)
-				default:
-					syncTargets = append(syncTargets, filesync.WithFSSyncDir(exID, ex.OutputDir))
 				}
+
+				// TODO: this should be dependent on the exporter id (to allow multiple oci exporters)
+				storeName := "export"
+				if _, ok := contentStores[storeName]; ok {
+					return nil, errors.Errorf("oci store key %q already exists", storeName)
+				}
+				contentStores[storeName] = store
 			}
 		}
 
@@ -208,6 +215,10 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 
 		if len(syncTargets) > 0 {
 			s.Allow(filesync.NewFSSyncTarget(syncTargets...))
+		}
+
+		if opt.SourcePolicyProvider != nil {
+			s.Allow(opt.SourcePolicyProvider)
 		}
 
 		eg.Go(func() error {
@@ -222,6 +233,9 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 	frontendAttrs := maps.Clone(opt.FrontendAttrs)
 	maps.Copy(frontendAttrs, cacheOpt.frontendAttrs)
 
+	const statusInactivityTimeout = 5 * time.Second
+	statusActivity := make(chan struct{}, 1)
+
 	solveCtx, cancelSolve := context.WithCancelCause(ctx)
 	var res *SolveResponse
 	eg.Go(func() error {
@@ -230,8 +244,21 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 
 		defer func() { // make sure the Status ends cleanly on build errors
 			go func() {
-				<-time.After(3 * time.Second)
-				cancelStatus(errors.WithStack(context.Canceled))
+				// Start inactivity monitoring after solve completes
+				statusInactivityTimer := time.NewTimer(statusInactivityTimeout)
+				defer statusInactivityTimer.Stop()
+				for {
+					select {
+					case <-statusContext.Done():
+						return
+					case <-statusActivity:
+						// Reset timer on activity
+						statusInactivityTimer.Reset(statusInactivityTimeout)
+					case <-statusInactivityTimer.C:
+						cancelStatus(errors.WithStack(context.Canceled))
+						return
+					}
+				}
 			}()
 			if !opt.SessionPreInitialized {
 				bklog.G(ctx).Debugf("stopping session")
@@ -266,21 +293,28 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 			})
 		}
 
-		resp, err := c.ControlClient().Solve(ctx, &controlapi.SolveRequest{
+		sopt := &controlapi.SolveRequest{
 			Ref:                     ref,
 			Definition:              pbd,
 			Exporters:               exports,
 			ExporterDeprecated:      exportDeprecated,
 			ExporterAttrsDeprecated: exportAttrDeprecated,
+			EnableSessionExporter:   opt.EnableSessionExporter,
 			Session:                 s.ID(),
 			Frontend:                opt.Frontend,
 			FrontendAttrs:           frontendAttrs,
 			FrontendInputs:          frontendInputs,
 			Cache:                   &cacheOpt.options,
-			Entitlements:            entitlementsToPB(opt.AllowedEntitlements),
+			Entitlements:            slices.Clone(opt.AllowedEntitlements),
 			Internal:                opt.Internal,
+			CompatibilityVersion:    int64(opt.CompatibilityVersion),
 			SourcePolicy:            opt.SourcePolicy,
-		})
+		}
+		if opt.SourcePolicyProvider != nil {
+			sopt.SourcePolicySession = s.ID()
+		}
+
+		resp, err := c.ControlClient().Solve(ctx, sopt)
 		if err != nil {
 			return errors.Wrap(err, "failed to solve")
 		}
@@ -322,10 +356,19 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 		for {
 			resp, err := stream.Recv()
 			if err != nil {
-				if err == io.EOF {
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
+				// Ignore context canceled, triggered after inactivity timeout
+				if errors.Is(err, context.Canceled) || statusContext.Err() != nil {
 					return nil
 				}
 				return errors.Wrap(err, "failed to receive status")
+			}
+			// Signal activity (non-blocking)
+			select {
+			case statusActivity <- struct{}{}:
+			default:
 			}
 			if statusChan != nil {
 				statusChan <- NewSolveStatus(resp)
@@ -356,12 +399,12 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 			return nil, err
 		}
 		var manifestDesc ocispecs.Descriptor
-		if err = json.Unmarshal([]byte(manifestDescDt), &manifestDesc); err != nil {
+		if err = json.Unmarshal(manifestDescDt, &manifestDesc); err != nil {
 			return nil, err
 		}
 		for _, storePath := range storesToUpdate {
 			names := []ociindex.NameOrTag{ociindex.Tag("latest")}
-			if t, ok := res.ExporterResponse["image.name"]; ok {
+			if t, ok := res.ExporterResponse[exptypes.ExporterImageNameKey]; ok {
 				inp := strings.Split(t, ",")
 				names = make([]ociindex.NameOrTag, len(inp))
 				for i, n := range inp {
@@ -402,8 +445,7 @@ func prepareSyncedFiles(def *llb.Definition, localMounts map[string]fsutil.FS) (
 				return nil, errors.Wrap(err, "failed to parse llb proto op")
 			}
 			if src := op.GetSource(); src != nil {
-				if strings.HasPrefix(src.Identifier, "local://") {
-					name := strings.TrimPrefix(src.Identifier, "local://")
+				if name, ok := strings.CutPrefix(src.Identifier, "local://"); ok {
 					mount, ok := localMounts[name]
 					if !ok {
 						return nil, errors.Errorf("local directory %s not enabled", name)
@@ -481,25 +523,32 @@ func parseCacheOptions(ctx context.Context, isGateway bool, opt SolveOpt) (*cach
 				bklog.G(ctx).Warning("local cache import at " + csDir + " not found due to err: " + err.Error())
 				continue
 			}
+			dgst := im.Attrs["digest"]
 			// if digest is not specified, attempt to load from tag
-			if im.Attrs["digest"] == "" {
+			if dgst == "" {
 				tag := "latest"
 				if t, ok := im.Attrs["tag"]; ok {
 					tag = t
+				}
+				if tag == "" {
+					return nil, errors.New("local cache importer requires either explicit digest, \"latest\" tag or custom tag on index.json")
 				}
 
 				idx := ociindex.NewStoreIndex(csDir)
 				desc, err := idx.Get(tag)
 				if err != nil {
-					bklog.G(ctx).Warning("local cache import at " + csDir + " not found due to err: " + err.Error())
+					bklog.G(ctx).Warning("local cache import at " + csDir + " skipped due to err: " + err.Error())
 					continue
 				}
-				if desc != nil {
-					im.Attrs["digest"] = desc.Digest.String()
+				if desc == nil {
+					bklog.G(ctx).Warning("local cache import at " + csDir + " skipped: no digest found for tag " + tag)
+					continue
 				}
+				im.Attrs["digest"] = desc.Digest.String()
 			}
-			if im.Attrs["digest"] == "" {
-				return nil, errors.New("local cache importer requires either explicit digest, \"latest\" tag or custom tag on index.json")
+			if _, err := cs.Info(ctx, digest.Digest(im.Attrs["digest"])); err != nil {
+				bklog.G(ctx).Warning("local cache import at " + csDir + " skipped: digest " + im.Attrs["digest"] + " unavailable: " + err.Error())
+				continue
 			}
 			contentStores["local:"+csDir] = cs
 		}
@@ -533,31 +582,4 @@ func parseCacheOptions(ctx context.Context, isGateway bool, opt SolveOpt) (*cach
 		frontendAttrs:  frontendAttrs,
 	}
 	return &res, nil
-}
-
-func prepareMounts(opt *SolveOpt) (map[string]fsutil.FS, error) {
-	// merge local mounts and fallback local directories together
-	mounts := make(map[string]fsutil.FS)
-	for k, mount := range opt.LocalMounts {
-		mounts[k] = mount
-	}
-	for k, dir := range opt.LocalDirs {
-		mount, err := fsutil.NewFS(dir)
-		if err != nil {
-			return nil, err
-		}
-		if _, ok := mounts[k]; ok {
-			return nil, errors.Errorf("local mount %s already exists", k)
-		}
-		mounts[k] = mount
-	}
-	return mounts, nil
-}
-
-func entitlementsToPB(entitlements []entitlements.Entitlement) []string {
-	clone := make([]string, len(entitlements))
-	for i, e := range entitlements {
-		clone[i] = string(e)
-	}
-	return clone
 }

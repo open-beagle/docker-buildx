@@ -43,7 +43,7 @@ import (
 // In particular, ImpliedType will never use capsule types in its returned
 // type, because it cannot know the capsule types supported by the calling
 // program.
-func ImpliedType(gv interface{}) (cty.Type, error) {
+func ImpliedType(gv any) (cty.Type, error) {
 	rt := reflect.TypeOf(gv)
 	var path cty.Path
 	return impliedType(rt, path)
@@ -133,8 +133,8 @@ func impliedStructType(rt reflect.Type, path cty.Path) (cty.Type, error) {
 }
 
 var (
-	valueType  = reflect.TypeOf(cty.Value{})
-	stringType = reflect.TypeOf("")
+	valueType  = reflect.TypeFor[cty.Value]()
+	stringType = reflect.TypeFor[string]()
 )
 
 // structTagIndices interrogates the fields of the given type (which must
@@ -148,7 +148,7 @@ func structTagIndices(st reflect.Type) map[string]int {
 	ct := st.NumField()
 	ret := make(map[string]int, ct)
 
-	for i := 0; i < ct; i++ {
+	for i := range ct {
 		field := st.Field(i)
 		attrName := field.Tag.Get("cty")
 		if attrName != "" {

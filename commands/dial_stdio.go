@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"io"
 	"net"
 	"os"
@@ -12,10 +13,9 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/moby/buildkit/util/appcontext"
 	"github.com/moby/buildkit/util/progress/progressui"
-	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"golang.org/x/sync/errgroup"
 )
 
 type stdioOptions struct {
@@ -44,12 +44,17 @@ func runDialStdio(dockerCli command.Cli, opts stdioOptions) error {
 		return err
 	}
 
-	printer, err := progress.NewPrinter(ctx, os.Stderr, progressui.DisplayMode(opts.progress), progress.WithPhase("dial-stdio"), progress.WithDesc("builder: "+b.Name, "builder:"+b.Name))
+	progressMode := opts.progress
+	if progressMode == "none" { // in buildx "quiet" means printing image ID in the end
+		progressMode = "quiet"
+	}
+
+	printer, err := progress.NewPrinter(ctx, os.Stderr, progressui.DisplayMode(progressMode), progress.WithPhase("dial-stdio"), progress.WithDesc("builder: "+b.Name, "builder:"+b.Name))
 	if err != nil {
 		return err
 	}
 
-	var p *v1.Platform
+	var p *ocispecs.Platform
 	if opts.platform != "" {
 		pp, err := platforms.Parse(opts.platform)
 		if err != nil {
@@ -74,27 +79,42 @@ func runDialStdio(dockerCli command.Cli, opts stdioOptions) error {
 			return err
 		}
 
-		defer conn.Close()
-
-		go func() {
-			<-ctx.Done()
-			closeWrite(conn)
-		}()
-
-		var eg errgroup.Group
-
-		eg.Go(func() error {
-			_, err := io.Copy(conn, os.Stdin)
-			closeWrite(conn)
-			return err
-		})
-		eg.Go(func() error {
-			_, err := io.Copy(os.Stdout, conn)
-			closeRead(conn)
-			return err
-		})
-		return eg.Wait()
+		return proxyConn(ctx, conn, os.Stdin, os.Stdout)
 	})
+}
+
+func proxyConn(ctx context.Context, conn net.Conn, stdin io.Reader, stdout io.Writer) error {
+	defer conn.Close()
+
+	stdinDone := make(chan error, 1)
+	stdoutDone := make(chan error, 1)
+
+	go func() {
+		_, err := io.Copy(conn, stdin)
+		closeWrite(conn)
+		stdinDone <- err
+	}()
+	go func() {
+		_, err := io.Copy(stdout, conn)
+		closeRead(conn)
+		stdoutDone <- err
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case err := <-stdinDone:
+			if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+				return err
+			}
+		case err := <-stdoutDone:
+			if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+				return err
+			}
+			return nil
+		}
+	}
 }
 
 func closeRead(conn net.Conn) error {
@@ -122,10 +142,11 @@ func dialStdioCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 			opts.builder = rootOpts.builder
 			return runDialStdio(dockerCli, opts)
 		},
+		DisableFlagsInUseLine: true,
 	}
 
 	flags := cmd.Flags()
 	flags.StringVar(&opts.platform, "platform", os.Getenv("DOCKER_DEFAULT_PLATFORM"), "Target platform: this is used for node selection")
-	flags.StringVar(&opts.progress, "progress", "quiet", `Set type of progress output ("auto", "plain", "tty", "rawjson"). Use plain to show container output`)
+	flags.StringVar(&opts.progress, "progress", "none", `Set type of progress output ("auto", "plain", "rawjson", "tty"). Use plain to show container output`)
 	return cmd
 }

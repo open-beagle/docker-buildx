@@ -1,14 +1,10 @@
 package buildflags
 
 import (
-	"context"
 	"encoding/json"
 	"maps"
-	"os"
 	"strings"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	controllerapi "github.com/docker/buildx/controller/pb"
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/go-csvvalue"
 	"github.com/zclconf/go-cty/cty"
@@ -32,22 +28,6 @@ func (o CacheOptions) Normalize() CacheOptions {
 		return nil
 	}
 	return removeDupes(o)
-}
-
-func (o CacheOptions) ToPB() []*controllerapi.CacheOptionsEntry {
-	if len(o) == 0 {
-		return nil
-	}
-
-	var outs []*controllerapi.CacheOptionsEntry
-	for _, entry := range o {
-		pb := entry.ToPB()
-		if !isActive(pb) {
-			continue
-		}
-		outs = append(outs, pb)
-	}
-	return outs
 }
 
 type CacheOptionsEntry struct {
@@ -78,16 +58,6 @@ func (e *CacheOptionsEntry) String() string {
 		b.WriteAttributes(e.Attrs)
 	}
 	return b.String()
-}
-
-func (e *CacheOptionsEntry) ToPB() *controllerapi.CacheOptionsEntry {
-	ci := &controllerapi.CacheOptionsEntry{
-		Type:  e.Type,
-		Attrs: maps.Clone(e.Attrs),
-	}
-	addGithubToken(ci)
-	addAwsCredentials(ci)
-	return ci
 }
 
 func (e *CacheOptionsEntry) MarshalJSON() ([]byte, error) {
@@ -149,7 +119,7 @@ func (e *CacheOptionsEntry) UnmarshalText(text []byte) error {
 	return e.validate(text)
 }
 
-func (e *CacheOptionsEntry) validate(gv interface{}) error {
+func (e *CacheOptionsEntry) validate(gv any) error {
 	if e.Type == "" {
 		var text []byte
 		switch gv := gv.(type) {
@@ -174,6 +144,10 @@ func ParseCacheEntry(in []string) (CacheOptions, error) {
 
 	opts := make(CacheOptions, 0, len(in))
 	for _, in := range in {
+		if in == "" {
+			continue
+		}
+
 		if !strings.Contains(in, "=") {
 			// This is ref only format. Each field in the CSV is its own entry.
 			fields, err := csvvalue.Fields(in, nil)
@@ -198,58 +172,4 @@ func ParseCacheEntry(in []string) (CacheOptions, error) {
 		opts = append(opts, &out)
 	}
 	return opts, nil
-}
-
-func addGithubToken(ci *controllerapi.CacheOptionsEntry) {
-	if ci.Type != "gha" {
-		return
-	}
-	if _, ok := ci.Attrs["token"]; !ok {
-		if v, ok := os.LookupEnv("ACTIONS_RUNTIME_TOKEN"); ok {
-			ci.Attrs["token"] = v
-		}
-	}
-	if _, ok := ci.Attrs["url"]; !ok {
-		if v, ok := os.LookupEnv("ACTIONS_CACHE_URL"); ok {
-			ci.Attrs["url"] = v
-		}
-	}
-}
-
-func addAwsCredentials(ci *controllerapi.CacheOptionsEntry) {
-	if ci.Type != "s3" {
-		return
-	}
-	_, okAccessKeyID := ci.Attrs["access_key_id"]
-	_, okSecretAccessKey := ci.Attrs["secret_access_key"]
-	// If the user provides access_key_id, secret_access_key, do not override the session token.
-	if okAccessKeyID && okSecretAccessKey {
-		return
-	}
-	ctx := context.TODO()
-	awsConfig, err := awsconfig.LoadDefaultConfig(ctx)
-	if err != nil {
-		return
-	}
-	credentials, err := awsConfig.Credentials.Retrieve(ctx)
-	if err != nil {
-		return
-	}
-	if !okAccessKeyID && credentials.AccessKeyID != "" {
-		ci.Attrs["access_key_id"] = credentials.AccessKeyID
-	}
-	if !okSecretAccessKey && credentials.SecretAccessKey != "" {
-		ci.Attrs["secret_access_key"] = credentials.SecretAccessKey
-	}
-	if _, ok := ci.Attrs["session_token"]; !ok && credentials.SessionToken != "" {
-		ci.Attrs["session_token"] = credentials.SessionToken
-	}
-}
-
-func isActive(pb *controllerapi.CacheOptionsEntry) bool {
-	// Always active if not gha.
-	if pb.Type != "gha" {
-		return true
-	}
-	return pb.Attrs["token"] != "" && pb.Attrs["url"] != ""
 }

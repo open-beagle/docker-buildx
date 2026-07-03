@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"slices"
 	"strings"
 
 	"github.com/containerd/platforms"
@@ -59,8 +60,8 @@ func NewState(o Output) State {
 type State struct {
 	out   Output
 	prev  *State
-	key   interface{}
-	value func(context.Context, *Constraints) (interface{}, error)
+	key   any
+	value func(context.Context, *Constraints) (any, error)
 	opts  []ConstraintsOpt
 	async *asyncState
 }
@@ -76,13 +77,13 @@ func (s State) ensurePlatform() State {
 	return s
 }
 
-func (s State) WithValue(k, v interface{}) State {
-	return s.withValue(k, func(context.Context, *Constraints) (interface{}, error) {
+func (s State) WithValue(k, v any) State {
+	return s.withValue(k, func(context.Context, *Constraints) (any, error) {
 		return v, nil
 	})
 }
 
-func (s State) withValue(k interface{}, v func(context.Context, *Constraints) (interface{}, error)) State {
+func (s State) withValue(k any, v func(context.Context, *Constraints) (any, error)) State {
 	return State{
 		out:   s.Output(),
 		prev:  &s, // doesn't need to be original pointer
@@ -91,7 +92,7 @@ func (s State) withValue(k interface{}, v func(context.Context, *Constraints) (i
 	}
 }
 
-func (s State) Value(ctx context.Context, k interface{}, co ...ConstraintsOpt) (interface{}, error) {
+func (s State) Value(ctx context.Context, k any, co ...ConstraintsOpt) (any, error) {
 	c := &Constraints{}
 	for _, f := range co {
 		f.SetConstraintsOption(c)
@@ -99,12 +100,12 @@ func (s State) Value(ctx context.Context, k interface{}, co ...ConstraintsOpt) (
 	return s.getValue(k)(ctx, c)
 }
 
-func (s State) getValue(k interface{}) func(context.Context, *Constraints) (interface{}, error) {
+func (s State) getValue(k any) func(context.Context, *Constraints) (any, error) {
 	if s.key == k {
 		return s.value
 	}
 	if s.async != nil {
-		return func(ctx context.Context, c *Constraints) (interface{}, error) {
+		return func(ctx context.Context, c *Constraints) (any, error) {
 			target, err := s.async.Do(ctx, c)
 			if err != nil {
 				return nil, err
@@ -271,7 +272,7 @@ func (s State) WithImageConfig(c []byte) (State, error) {
 			OSVersion:    img.OSVersion,
 		}
 		if img.OSFeatures != nil {
-			plat.OSFeatures = append([]string{}, img.OSFeatures...)
+			plat.OSFeatures = slices.Clone(img.OSFeatures)
 		}
 		s = s.Platform(plat)
 	}
@@ -295,6 +296,7 @@ func (s State) Run(ro ...RunOption) ExecState {
 	}
 	exec.secrets = ei.Secrets
 	exec.ssh = ei.SSH
+	exec.cdiDevices = ei.CDIDevices
 
 	return ExecState{
 		State: s.WithOutput(exec.Output()),
@@ -320,7 +322,7 @@ func (s State) AddEnv(key, value string) State {
 }
 
 // AddEnvf is the same as [State.AddEnv] but with a format string.
-func (s State) AddEnvf(key, value string, v ...interface{}) State {
+func (s State) AddEnvf(key, value string, v ...any) State {
 	return AddEnvf(key, value, v...)(s)
 }
 
@@ -331,7 +333,7 @@ func (s State) Dir(str string) State {
 }
 
 // Dirf is the same as [State.Dir] but with a format string.
-func (s State) Dirf(str string, v ...interface{}) State {
+func (s State) Dirf(str string, v ...any) State {
 	return Dirf(str, v...)(s)
 }
 
@@ -349,8 +351,7 @@ func (s State) GetEnv(ctx context.Context, key string, co ...ConstraintsOpt) (st
 	return v, ok, nil
 }
 
-// Env returns a new [State] with the provided environment variable set.
-// See [Env]
+// Env returns the current environment variables for the state.
 func (s State) Env(ctx context.Context, co ...ConstraintsOpt) (*EnvList, error) {
 	c := &Constraints{}
 	for _, f := range co {
@@ -525,6 +526,7 @@ type ConstraintsOpt interface {
 	RunOption
 	LocalOption
 	HTTPOption
+	ImageBlobOption
 	ImageOption
 	GitOption
 	OCILayoutOption
@@ -550,6 +552,10 @@ func (fn constraintsOptFunc) SetOCILayoutOption(oi *OCILayoutInfo) {
 
 func (fn constraintsOptFunc) SetHTTPOption(hi *HTTPInfo) {
 	hi.applyConstraints(fn)
+}
+
+func (fn constraintsOptFunc) SetImageBlobOption(ii *ImageBlobInfo) {
+	ii.applyConstraints(fn)
 }
 
 func (fn constraintsOptFunc) SetImageOption(ii *ImageInfo) {
@@ -607,7 +613,7 @@ func WithCustomName(name string) ConstraintsOpt {
 	})
 }
 
-func WithCustomNamef(name string, a ...interface{}) ConstraintsOpt {
+func WithCustomNamef(name string, a ...any) ConstraintsOpt {
 	return WithCustomName(fmt.Sprintf(name, a...))
 }
 
@@ -735,6 +741,7 @@ var (
 	LinuxS390x   = Platform(ocispecs.Platform{OS: "linux", Architecture: "s390x"})
 	LinuxPpc64   = Platform(ocispecs.Platform{OS: "linux", Architecture: "ppc64"})
 	LinuxPpc64le = Platform(ocispecs.Platform{OS: "linux", Architecture: "ppc64le"})
+	LinuxRiscv64 = Platform(ocispecs.Platform{OS: "linux", Architecture: "riscv64"})
 	Darwin       = Platform(ocispecs.Platform{OS: "darwin", Architecture: "amd64"})
 	Windows      = Platform(ocispecs.Platform{OS: "windows", Architecture: "amd64"})
 )
@@ -745,6 +752,6 @@ func Require(filters ...string) ConstraintsOpt {
 	})
 }
 
-func nilValue(context.Context, *Constraints) (interface{}, error) {
+func nilValue(context.Context, *Constraints) (any, error) {
 	return nil, nil
 }

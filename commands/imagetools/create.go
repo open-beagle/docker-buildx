@@ -5,18 +5,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
-	"github.com/distribution/reference"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/platforms"
 	"github.com/docker/buildx/builder"
 	"github.com/docker/buildx/util/buildflags"
 	"github.com/docker/buildx/util/cobrautil/completion"
 	"github.com/docker/buildx/util/imagetools"
 	"github.com/docker/buildx/util/progress"
 	"github.com/docker/cli/cli/command"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/util/progress/progressui"
+	"github.com/moby/sys/atomicwriter"
 	"github.com/opencontainers/go-digest"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
@@ -31,6 +35,8 @@ type createOptions struct {
 	actionAppend bool
 	progress     string
 	preferIndex  bool
+	platforms    []string
+	metadataFile string
 }
 
 func runCreate(ctx context.Context, dockerCli command.Cli, in createOptions, args []string) error {
@@ -53,7 +59,7 @@ func runCreate(ctx context.Context, dockerCli command.Cli, in createOptions, arg
 
 	args = append(fileArgs, args...)
 
-	tags, err := parseRefs(in.tags)
+	tags, err := parseLocations(in.tags)
 	if err != nil {
 		return err
 	}
@@ -67,11 +73,21 @@ func runCreate(ctx context.Context, dockerCli command.Cli, in createOptions, arg
 		return err
 	}
 
-	repos := map[string]struct{}{}
+	platforms, err := parsePlatforms(in.platforms)
+	if err != nil {
+		return err
+	}
 
+	repos := map[string]struct{}{}
 	for _, t := range tags {
 		repos[t.Name()] = struct{}{}
 	}
+
+	repoNames := make([]string, 0, len(repos))
+	for repo := range repos {
+		repoNames = append(repoNames, repo)
+	}
+	sort.Strings(repoNames)
 
 	sourceRefs := false
 	for _, s := range srcs {
@@ -85,10 +101,16 @@ func runCreate(ctx context.Context, dockerCli command.Cli, in createOptions, arg
 		return errors.Errorf("no repositories specified, please set a reference in tag or source")
 	}
 
-	var defaultRepo *string
+	var defaultRepo *imagetools.Location
 	if len(repos) == 1 {
-		for repo := range repos {
-			defaultRepo = &repo
+		for _, src := range srcs {
+			if src.Ref != nil {
+				defaultRepo = src.Ref
+				break
+			}
+		}
+		if defaultRepo == nil && len(tags) > 0 {
+			defaultRepo = tags[0]
 		}
 	}
 
@@ -97,19 +119,19 @@ func runCreate(ctx context.Context, dockerCli command.Cli, in createOptions, arg
 			if defaultRepo == nil {
 				return errors.Errorf("multiple repositories specified, cannot infer repository for %q", args[i])
 			}
-			n, err := reference.ParseNormalizedNamed(*defaultRepo)
-			if err != nil {
-				return err
-			}
 			if s.Desc.MediaType == "" && s.Desc.Digest != "" {
-				r, err := reference.WithDigest(n, s.Desc.Digest)
+				r, err := defaultRepo.WithDigest(s.Desc.Digest)
 				if err != nil {
 					return err
 				}
 				srcs[i].Ref = r
 				sourceRefs = true
 			} else {
-				srcs[i].Ref = reference.TagNameOnly(n)
+				r, err := defaultRepo.TagNameOnly()
+				if err != nil {
+					return err
+				}
+				srcs[i].Ref = r
 			}
 		}
 	}
@@ -160,7 +182,7 @@ func runCreate(ctx context.Context, dockerCli command.Cli, in createOptions, arg
 		return errors.Wrapf(err, "failed to parse annotations")
 	}
 
-	dt, desc, err := r.Combine(ctx, srcs, annotations, in.preferIndex)
+	dt, desc, manifests, err := r.Combine(ctx, srcs, annotations, in.preferIndex, platforms)
 	if err != nil {
 		return err
 	}
@@ -170,12 +192,21 @@ func runCreate(ctx context.Context, dockerCli command.Cli, in createOptions, arg
 		return nil
 	}
 
+	// manifests can be nil only if pushing one single-platform desc directly
+	if manifests == nil {
+		manifests = []imagetools.DescWithSource{{Descriptor: desc, Source: srcs[0]}}
+	}
+
 	// new resolver cause need new auth
 	r = imagetools.New(imageopt)
 
 	ctx2, cancel := context.WithCancelCause(context.TODO())
 	defer func() { cancel(errors.WithStack(context.Canceled)) }()
-	printer, err := progress.NewPrinter(ctx2, os.Stderr, progressui.DisplayMode(in.progress))
+	progressMode := in.progress
+	if progressMode == "none" {
+		progressMode = "quiet"
+	}
+	printer, err := progress.NewPrinter(ctx2, os.Stderr, progressui.DisplayMode(progressMode))
 	if err != nil {
 		return err
 	}
@@ -183,27 +214,49 @@ func runCreate(ctx context.Context, dockerCli command.Cli, in createOptions, arg
 	eg, _ := errgroup.WithContext(ctx)
 	pw := progress.WithPrefix(printer, "internal", true)
 
+	tagsByRepo := map[string][]*imagetools.Location{}
 	for _, t := range tags {
-		t := t
+		repo := t.Name()
+		tagsByRepo[repo] = append(tagsByRepo[repo], t)
+	}
+
+	for repo, repoTags := range tagsByRepo {
 		eg.Go(func() error {
-			return progress.Wrap(fmt.Sprintf("pushing %s", t.String()), pw.Write, func(sub progress.SubLogger) error {
+			seed := repoTags[0]
+			return progress.Wrap(fmt.Sprintf("pushing %s", repo), pw.Write, func(sub progress.SubLogger) error {
+				ctx = withMediaTypeKeyPrefix(ctx)
+				// Create a single shared ingester for all concurrent
+				// copies to this repo. The pushingIngester's per-digest
+				// locking prevents concurrent pushes of the same blob
+				// from racing against each other on the registry.
+				ingester, err := r.IngesterForLocation(ctx, seed)
+				if err != nil {
+					return err
+				}
 				eg2, _ := errgroup.WithContext(ctx)
-				for _, s := range srcs {
-					if reference.Domain(s.Ref) == reference.Domain(t) && reference.Path(s.Ref) == reference.Path(t) {
-						continue
-					}
-					s := s
+				for _, desc := range manifests {
 					eg2.Go(func() error {
-						sub.Log(1, []byte(fmt.Sprintf("copying %s from %s to %s\n", s.Desc.Digest.String(), s.Ref.String(), t.String())))
-						return r.Copy(ctx, s, t)
+						sub.Log(1, fmt.Appendf(nil, "copying %s from %s to %s\n", desc.Digest.String(), desc.Source.Ref.String(), repo))
+						err := r.CopyWithIngester(ctx, &imagetools.Source{
+							Ref:  desc.Source.Ref,
+							Desc: desc.Descriptor,
+						}, seed, ingester)
+						if err != nil {
+							return errors.Wrapf(err, "copy %s from %s to %s", desc.Digest.String(), desc.Source.Ref.String(), seed.String())
+						}
+						return nil
 					})
 				}
-
 				if err := eg2.Wait(); err != nil {
 					return err
 				}
-				sub.Log(1, []byte(fmt.Sprintf("pushing %s to %s\n", desc.Digest.String(), t.String())))
-				return r.Push(ctx, t, desc, dt)
+				for _, t := range repoTags {
+					sub.Log(1, fmt.Appendf(nil, "pushing %s to %s\n", desc.Digest.String(), t.String()))
+					if err := r.Push(ctx, t, desc, dt); err != nil {
+						return errors.Wrapf(err, "publish %s to %s", desc.Digest.String(), t.String())
+					}
+				}
+				return nil
 			})
 		})
 	}
@@ -212,6 +265,15 @@ func runCreate(ctx context.Context, dockerCli command.Cli, in createOptions, arg
 	err1 := printer.Wait()
 	if err == nil {
 		err = err1
+	}
+
+	if err == nil && len(in.metadataFile) > 0 {
+		if err := writeMetadataFile(in.metadataFile, map[string]any{
+			exptypes.ExporterImageDescriptorKey: desc,
+			exptypes.ExporterImageNameKey:       strings.Join(repoNames, ","),
+		}); err != nil {
+			return err
+		}
 	}
 
 	return err
@@ -229,10 +291,38 @@ func parseSources(in []string) ([]*imagetools.Source, error) {
 	return out, nil
 }
 
-func parseRefs(in []string) ([]reference.Named, error) {
-	refs := make([]reference.Named, len(in))
+func parsePlatforms(in []string) ([]ocispecs.Platform, error) {
+	out := make([]ocispecs.Platform, 0, len(in))
+	for _, p := range in {
+		if arr := strings.Split(p, ","); len(arr) > 1 {
+			v, err := parsePlatforms(arr)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, v...)
+			continue
+		}
+		plat, err := platforms.Parse(p)
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid platform %q", p)
+		}
+		out = append(out, plat)
+	}
+	return out, nil
+}
+
+func withMediaTypeKeyPrefix(ctx context.Context) context.Context {
+	ctx = remotes.WithMediaTypeKeyPrefix(ctx, "application/vnd.oci.empty.v1+json", "empty")
+	ctx = remotes.WithMediaTypeKeyPrefix(ctx, "application/vnd.dev.cosign.artifact.sig.v1+json", "cosign")
+	ctx = remotes.WithMediaTypeKeyPrefix(ctx, "application/vnd.dev.cosign.simplesigning.v1+json", "simplesigning")
+	ctx = remotes.WithMediaTypeKeyPrefix(ctx, "application/vnd.dev.sigstore.bundle.v0.3+json", "sigstore-bundle")
+	return ctx
+}
+
+func parseLocations(in []string) ([]*imagetools.Location, error) {
+	refs := make([]*imagetools.Location, len(in))
 	for i, in := range in {
-		n, err := reference.ParseNormalizedNamed(in)
+		n, err := imagetools.ParseLocation(in)
 		if err != nil {
 			return nil, err
 		}
@@ -246,7 +336,7 @@ func parseSource(in string) (*imagetools.Source, error) {
 	dgst, err := digest.Parse(in)
 	if err == nil {
 		return &imagetools.Source{
-			Desc: ocispec.Descriptor{
+			Desc: ocispecs.Descriptor{
 				Digest: dgst,
 			},
 		}, nil
@@ -254,10 +344,10 @@ func parseSource(in string) (*imagetools.Source, error) {
 		return nil, err
 	}
 
-	ref, err := reference.ParseNormalizedNamed(in)
+	loc, err := imagetools.ParseLocation(in)
 	if err == nil {
 		return &imagetools.Source{
-			Ref: ref,
+			Ref: loc,
 		}, nil
 	} else if !strings.HasPrefix(in, "{") {
 		return nil, err
@@ -274,13 +364,14 @@ func createCmd(dockerCli command.Cli, opts RootOptions) *cobra.Command {
 	var options createOptions
 
 	cmd := &cobra.Command{
-		Use:   "create [OPTIONS] [SOURCE] [SOURCE...]",
+		Use:   "create [OPTIONS] [SOURCE...]",
 		Short: "Create a new image based on source images",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			options.builder = *opts.Builder
 			return runCreate(cmd.Context(), dockerCli, options, args)
 		},
-		ValidArgsFunction: completion.Disable,
+		ValidArgsFunction:     completion.Disable,
+		DisableFlagsInUseLine: true,
 	}
 
 	flags := cmd.Flags()
@@ -288,16 +379,18 @@ func createCmd(dockerCli command.Cli, opts RootOptions) *cobra.Command {
 	flags.StringArrayVarP(&options.tags, "tag", "t", []string{}, "Set reference for new image")
 	flags.BoolVar(&options.dryrun, "dry-run", false, "Show final image instead of pushing")
 	flags.BoolVar(&options.actionAppend, "append", false, "Append to existing manifest")
-	flags.StringVar(&options.progress, "progress", "auto", `Set type of progress output ("auto", "plain", "tty", "rawjson"). Use plain to show container output`)
+	flags.StringVar(&options.progress, "progress", "auto", `Set type of progress output ("auto", "none", "plain", "rawjson", "tty"). Use plain to show container output`)
 	flags.StringArrayVarP(&options.annotations, "annotation", "", []string{}, "Add annotation to the image")
 	flags.BoolVar(&options.preferIndex, "prefer-index", true, "When only a single source is specified, prefer outputting an image index or manifest list instead of performing a carbon copy")
+	flags.StringArrayVarP(&options.platforms, "platform", "p", []string{}, "Filter specified platforms of target image")
+	flags.StringVar(&options.metadataFile, "metadata-file", "", "Write create result metadata to a file")
 
 	return cmd
 }
 
-func mergeDesc(d1, d2 ocispec.Descriptor) (ocispec.Descriptor, error) {
+func mergeDesc(d1, d2 ocispecs.Descriptor) (ocispecs.Descriptor, error) {
 	if d2.Size != 0 && d1.Size != d2.Size {
-		return ocispec.Descriptor{}, errors.Errorf("invalid size mismatch for %s, %d != %d", d1.Digest, d2.Size, d1.Size)
+		return ocispecs.Descriptor{}, errors.Errorf("invalid size mismatch for %s, %d != %d", d1.Digest, d2.Size, d1.Size)
 	}
 	if d2.MediaType != "" {
 		d1.MediaType = d2.MediaType
@@ -309,4 +402,12 @@ func mergeDesc(d1, d2 ocispec.Descriptor) (ocispec.Descriptor, error) {
 		d1.Platform = d2.Platform // missing items filled in later from image config
 	}
 	return d1, nil
+}
+
+func writeMetadataFile(filename string, dt any) error {
+	b, err := json.MarshalIndent(dt, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicwriter.WriteFile(filename, b, 0o644)
 }

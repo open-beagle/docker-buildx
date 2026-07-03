@@ -2,6 +2,7 @@ package workers
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,12 +18,26 @@ func withOTELSocketPath(socketPath string) integration.ConfigUpdater {
 
 type otelSocketPath string
 
-func (osp otelSocketPath) UpdateConfigFile(in string) string {
+func (osp otelSocketPath) UpdateConfigFile(in string) (string, func() error) {
 	return fmt.Sprintf(`%s
 
 [otel]
   socketPath = %q
-`, in, osp)
+`, in, osp), nil
+}
+
+func withCDISpecDir(specDir string) integration.ConfigUpdater {
+	return cdiSpecDir(specDir)
+}
+
+type cdiSpecDir string
+
+func (csd cdiSpecDir) UpdateConfigFile(in string) (string, func() error) {
+	return fmt.Sprintf(`%s
+
+[cdi]
+  specDirs = [%q]
+`, in, csd), nil
 }
 
 func runBuildkitd(
@@ -60,10 +75,17 @@ func runBuildkitd(
 	}
 	deferF.Append(func() error { return os.RemoveAll(tmpdir) })
 
-	cfgfile, err := integration.WriteConfig(
-		append(conf.DaemonConfig, withOTELSocketPath(getTraceSocketPath(tmpdir))))
+	cfgfile, release, err := integration.WriteConfig(
+		append(conf.DaemonConfig,
+			withOTELSocketPath(getTraceSocketPath(tmpdir)),
+			withCDISpecDir(conf.CDISpecDir),
+		),
+	)
 	if err != nil {
 		return "", "", nil, err
+	}
+	if release != nil {
+		deferF.Append(release)
 	}
 	deferF.Append(func() error {
 		return os.RemoveAll(filepath.Dir(cfgfile))
@@ -74,7 +96,7 @@ func runBuildkitd(
 	debugAddress := getBuildkitdDebugAddr(tmpdir)
 
 	args = append(args, "--root", tmpdir, "--addr", address, "--debug")
-	cmd := exec.Command(args[0], args[1:]...) //nolint:gosec // test utility
+	cmd := exec.CommandContext(context.TODO(), args[0], args[1:]...) //nolint:gosec // test utility
 	cmd.Env = append(
 		os.Environ(),
 		"BUILDKIT_DEBUG_EXEC_OUTPUT=1",

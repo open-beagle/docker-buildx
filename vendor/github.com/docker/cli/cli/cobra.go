@@ -3,19 +3,15 @@ package cli
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
-	pluginmanager "github.com/docker/cli/cli-plugins/manager"
+	"github.com/docker/cli/cli-plugins/metadata"
 	"github.com/docker/cli/cli/command"
 	cliflags "github.com/docker/cli/cli/flags"
-	"github.com/docker/docker/pkg/homedir"
-	"github.com/docker/docker/registry"
 	"github.com/fvbommel/sortorder"
 	"github.com/moby/term"
 	"github.com/morikuni/aec"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -62,13 +58,6 @@ func setupCommonRootCommand(rootCmd *cobra.Command) (*cliflags.ClientOptions, *c
 		"docs.code-delimiter": `"`, // https://github.com/docker/cli-docs-tool/blob/77abede22166eaea4af7335096bdcedd043f5b19/annotation/annotation.go#L20-L22
 	}
 
-	// Configure registry.CertsDir() when running in rootless-mode
-	if os.Getenv("ROOTLESSKIT_STATE_DIR") != "" {
-		if configHome, err := homedir.GetConfigHome(); err == nil {
-			registry.SetCertsDir(filepath.Join(configHome, "docker/certs.d"))
-		}
-	}
-
 	return opts, helpCommand
 }
 
@@ -92,12 +81,8 @@ func FlagErrorFunc(cmd *cobra.Command, err error) error {
 		return nil
 	}
 
-	usage := ""
-	if cmd.HasSubCommands() {
-		usage = "\n\n" + cmd.UsageString()
-	}
 	return StatusError{
-		Status:     fmt.Sprintf("%s\nSee '%s --help'.%s", err, cmd.CommandPath(), usage),
+		Status:     fmt.Sprintf("%s\n\nUsage:  %s\n\nRun '%s --help' for more information", err, cmd.UseLine(), cmd.CommandPath()),
 		StatusCode: 125,
 	}
 }
@@ -181,35 +166,6 @@ func (tcmd *TopLevelCommand) Initialize(ops ...command.CLIOption) error {
 	return tcmd.dockerCli.Initialize(tcmd.opts, ops...)
 }
 
-// VisitAll will traverse all commands from the root.
-// This is different from the VisitAll of cobra.Command where only parents
-// are checked.
-func VisitAll(root *cobra.Command, fn func(*cobra.Command)) {
-	for _, cmd := range root.Commands() {
-		VisitAll(cmd, fn)
-	}
-	fn(root)
-}
-
-// DisableFlagsInUseLine sets the DisableFlagsInUseLine flag on all
-// commands within the tree rooted at cmd.
-func DisableFlagsInUseLine(cmd *cobra.Command) {
-	VisitAll(cmd, func(ccmd *cobra.Command) {
-		// do not add a `[flags]` to the end of the usage line.
-		ccmd.DisableFlagsInUseLine = true
-	})
-}
-
-// HasCompletionArg returns true if a cobra completion arg request is found.
-func HasCompletionArg(args []string) bool {
-	for _, arg := range args {
-		if arg == cobra.ShellCompRequestCmd || arg == cobra.ShellCompNoDescRequestCmd {
-			return true
-		}
-	}
-	return false
-}
-
 var helpCommand = &cobra.Command{
 	Use:               "help [command]",
 	Short:             "Help about the command",
@@ -218,7 +174,7 @@ var helpCommand = &cobra.Command{
 	RunE: func(c *cobra.Command, args []string) error {
 		cmd, args, e := c.Root().Find(args)
 		if cmd == nil || e != nil || len(args) > 0 {
-			return errors.Errorf("unknown help topic: %v", strings.Join(args, " "))
+			return fmt.Errorf("unknown help topic: %v", strings.Join(args, " "))
 		}
 		helpFunc := cmd.HelpFunc()
 		helpFunc(cmd, args)
@@ -256,7 +212,7 @@ func hasAdditionalHelp(cmd *cobra.Command) bool {
 }
 
 func isPlugin(cmd *cobra.Command) bool {
-	return pluginmanager.IsPluginCommand(cmd)
+	return cmd.Annotations[metadata.CommandAnnotationPlugin] == "true"
 }
 
 func hasAliases(cmd *cobra.Command) bool {
@@ -294,11 +250,12 @@ func commandAliases(cmd *cobra.Command) string {
 	if cmd.HasParent() {
 		parentPath = cmd.Parent().CommandPath() + " "
 	}
-	aliases := cmd.CommandPath()
+	var aliases strings.Builder
+	aliases.WriteString(cmd.CommandPath())
 	for _, alias := range cmd.Aliases {
-		aliases += ", " + parentPath + alias
+		aliases.WriteString(", " + parentPath + alias)
 	}
-	return aliases
+	return aliases.String()
 }
 
 func topCommands(cmd *cobra.Command) []*cobra.Command {
@@ -341,8 +298,10 @@ func operationSubCommands(cmd *cobra.Command) []*cobra.Command {
 	return cmds
 }
 
+const defaultTermWidth = 80
+
 func wrappedFlagUsages(cmd *cobra.Command) string {
-	width := 80
+	width := defaultTermWidth
 	if ws, err := term.GetWinsize(0); err == nil {
 		width = int(ws.Width)
 	}
@@ -358,9 +317,9 @@ func decoratedName(cmd *cobra.Command) string {
 }
 
 func vendorAndVersion(cmd *cobra.Command) string {
-	if vendor, ok := cmd.Annotations[pluginmanager.CommandAnnotationPluginVendor]; ok && isPlugin(cmd) {
+	if vendor, ok := cmd.Annotations[metadata.CommandAnnotationPluginVendor]; ok && isPlugin(cmd) {
 		version := ""
-		if v, ok := cmd.Annotations[pluginmanager.CommandAnnotationPluginVersion]; ok && v != "" {
+		if v, ok := cmd.Annotations[metadata.CommandAnnotationPluginVersion]; ok && v != "" {
 			version = ", " + v
 		}
 		return fmt.Sprintf("(%s%s)", vendor, version)
@@ -392,13 +351,10 @@ func orchestratorSubCommands(cmd *cobra.Command) []*cobra.Command {
 func allManagementSubCommands(cmd *cobra.Command) []*cobra.Command {
 	cmds := []*cobra.Command{}
 	for _, sub := range cmd.Commands() {
-		if isPlugin(sub) {
-			if invalidPluginReason(sub) == "" {
-				cmds = append(cmds, sub)
-			}
+		if invalidPluginReason(sub) != "" {
 			continue
 		}
-		if sub.IsAvailableCommand() && sub.HasSubCommands() {
+		if sub.IsAvailableCommand() && (isPlugin(sub) || sub.HasSubCommands()) {
 			cmds = append(cmds, sub)
 		}
 	}
@@ -419,7 +375,7 @@ func invalidPlugins(cmd *cobra.Command) []*cobra.Command {
 }
 
 func invalidPluginReason(cmd *cobra.Command) string {
-	return cmd.Annotations[pluginmanager.CommandAnnotationPluginInvalid]
+	return cmd.Annotations[metadata.CommandAnnotationPluginInvalid]
 }
 
 const usageTemplate = `Usage:
@@ -522,4 +478,4 @@ Run '{{.CommandPath}} COMMAND --help' for more information on a command.
 `
 
 const helpTemplate = `
-{{if or .Runnable .HasSubCommands}}{{.UsageString}}{{end}}`
+{{- if or .Runnable .HasSubCommands}}{{.UsageString}}{{end}}`

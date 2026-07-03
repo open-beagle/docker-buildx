@@ -3,7 +3,11 @@ package bake
 import (
 	"context"
 	"encoding"
+	"encoding/json"
+	"fmt"
 	"io"
+	"maps"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -12,22 +16,21 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	composecli "github.com/compose-spec/compose-go/v2/cli"
 	"github.com/docker/buildx/bake/hclparser"
 	"github.com/docker/buildx/build"
-	controllerapi "github.com/docker/buildx/controller/pb"
 	"github.com/docker/buildx/util/buildflags"
 	"github.com/docker/buildx/util/platformutil"
 	"github.com/docker/buildx/util/progress"
-	"github.com/docker/cli/cli/config"
+	"github.com/docker/buildx/util/urlutil"
 	dockeropts "github.com/docker/cli/opts"
 	hcl "github.com/hashicorp/hcl/v2"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
-	"github.com/moby/buildkit/session/auth/authprovider"
-	"github.com/moby/buildkit/util/entitlements"
+	"github.com/moby/buildkit/frontend/dockerfile/dfgitutil"
 	"github.com/pkg/errors"
 	"github.com/zclconf/go-cty/cty"
 	"github.com/zclconf/go-cty/cty/convert"
@@ -46,6 +49,7 @@ type File struct {
 type Override struct {
 	Value    string
 	ArrValue []string
+	Append   bool
 }
 
 func defaultFilenames() []string {
@@ -179,7 +183,7 @@ func readWithProgress(r io.Reader, setStatus func(st *client.VertexStatus)) (dt 
 }
 
 func ListTargets(files []File) ([]string, error) {
-	c, _, err := ParseFiles(files, nil)
+	c, _, err := ParseFiles(files, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -193,8 +197,8 @@ func ListTargets(files []File) ([]string, error) {
 	return dedupSlice(targets), nil
 }
 
-func ReadTargets(ctx context.Context, files []File, targets, overrides []string, defaults map[string]string, ent *EntitlementConf) (map[string]*Target, map[string]*Group, error) {
-	c, _, err := ParseFiles(files, defaults)
+func ReadTargets(ctx context.Context, files []File, targets, overrides []string, defaults, vars map[string]string, ent *EntitlementConf) (map[string]*Target, map[string]*Group, error) {
+	c, _, err := ParseFiles(files, defaults, vars)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -202,6 +206,16 @@ func ReadTargets(ctx context.Context, files []File, targets, overrides []string,
 	for i, t := range targets {
 		targets[i] = sanitizeTargetName(t)
 	}
+
+	var tms []string
+	for _, t := range targets {
+		names, err := c.matchNames(t)
+		if err != nil {
+			return nil, nil, err
+		}
+		tms = append(tms, names...)
+	}
+	targets = dedupSlice(tms)
 
 	o, err := c.newOverrides(overrides)
 	if err != nil {
@@ -302,7 +316,28 @@ func sliceToMap(env []string) (res map[string]string) {
 	return
 }
 
-func ParseFiles(files []File, defaults map[string]string) (_ *Config, _ *hclparser.ParseMeta, err error) {
+func (c Config) matchNames(pattern string) ([]string, error) {
+	if !strings.ContainsAny(pattern, "*?[]") {
+		return []string{pattern}, nil
+	}
+	var names []string
+	for _, group := range c.Groups {
+		if ok, err := path.Match(pattern, group.Name); ok && err == nil {
+			names = append(names, group.Name)
+		}
+	}
+	for _, target := range c.Targets {
+		if ok, err := path.Match(pattern, target.Name); ok && err == nil {
+			names = append(names, target.Name)
+		}
+	}
+	if len(names) == 0 {
+		return nil, errors.Errorf("could not find any target matching %q", pattern)
+	}
+	return names, nil
+}
+
+func ParseFiles(files []File, defaults, vars map[string]string) (_ *Config, _ *hclparser.ParseMeta, err error) {
 	defer func() {
 		err = formatHCLError(err, files)
 	}()
@@ -311,7 +346,7 @@ func ParseFiles(files []File, defaults map[string]string) (_ *Config, _ *hclpars
 	var composeFiles []File
 	var hclFiles []*hcl.File
 	for _, f := range files {
-		isCompose, composeErr := validateComposeFile(f.Data, f.Name)
+		isCompose, composeErr := validateComposeFile(f.Data, f.Name, vars)
 		if isCompose {
 			if composeErr != nil {
 				return nil, nil, composeErr
@@ -334,7 +369,7 @@ func ParseFiles(files []File, defaults map[string]string) (_ *Config, _ *hclpars
 	}
 
 	if len(composeFiles) > 0 {
-		cfg, cmperr := ParseComposeFiles(composeFiles)
+		cfg, cmperr := ParseComposeFiles(composeFiles, vars)
 		if cmperr != nil {
 			return nil, nil, errors.Wrap(cmperr, "failed to parse compose file")
 		}
@@ -344,8 +379,17 @@ func ParseFiles(files []File, defaults map[string]string) (_ *Config, _ *hclpars
 
 	var pm hclparser.ParseMeta
 	if len(hclFiles) > 0 {
+		lookup := func(key string) (string, bool) {
+			if v, ok := vars[key]; ok {
+				return v, true
+			}
+			if envLookupAllowed() {
+				return os.LookupEnv(key)
+			}
+			return "", false
+		}
 		res, err := hclparser.Parse(hclparser.MergeFiles(hclFiles), hclparser.Opt{
-			LookupVar:     os.LookupEnv,
+			LookupVar:     lookup,
 			Vars:          defaults,
 			ValidateLabel: validateTargetName,
 		}, &c)
@@ -394,7 +438,7 @@ func dedupeConfig(c Config) Config {
 }
 
 func ParseFile(dt []byte, fn string) (*Config, error) {
-	c, _, err := ParseFiles([]File{{Data: dt, Name: fn}}, nil)
+	c, _, err := ParseFiles([]File{{Data: dt, Name: fn}}, nil, nil)
 	return c, err
 }
 
@@ -481,15 +525,12 @@ func (c Config) expandTargets(pattern string) ([]string, error) {
 func (c Config) loadLinks(name string, t *Target, m map[string]*Target, o map[string]map[string]Override, visited []string, ent *EntitlementConf) error {
 	visited = append(visited, name)
 	for _, v := range t.Contexts {
-		if strings.HasPrefix(v, "target:") {
-			target := strings.TrimPrefix(v, "target:")
+		if target, ok := strings.CutPrefix(v, "target:"); ok {
 			if target == name {
 				return errors.Errorf("target %s cannot link to itself", target)
 			}
-			for _, v := range visited {
-				if v == target {
-					return errors.Errorf("infinite loop from %s to %s", name, target)
-				}
+			if slices.Contains(visited, target) {
+				return errors.Errorf("infinite loop from %s to %s", name, target)
 			}
 			t2, ok := m[target]
 			if !ok {
@@ -529,9 +570,12 @@ func (c Config) newOverrides(v []string) (map[string]map[string]Override, error)
 	m := map[string]map[string]Override{}
 	for _, v := range v {
 		parts := strings.SplitN(v, "=", 2)
-		keys := strings.SplitN(parts[0], ".", 3)
+
+		skey := strings.TrimSuffix(parts[0], "+")
+		appendTo := strings.HasSuffix(parts[0], "+")
+		keys := strings.SplitN(skey, ".", 3)
 		if len(keys) < 2 {
-			return nil, errors.Errorf("invalid override key %s, expected target.name", parts[0])
+			return nil, errors.Errorf("invalid override key %s, expected target.name", skey)
 		}
 
 		pattern := keys[0]
@@ -544,8 +588,7 @@ func (c Config) newOverrides(v []string) (map[string]map[string]Override, error)
 			return nil, err
 		}
 
-		kk := strings.SplitN(parts[0], ".", 2)
-
+		okey := strings.Join(keys[1:], ".")
 		for _, name := range names {
 			t, ok := m[name]
 			if !ok {
@@ -553,25 +596,26 @@ func (c Config) newOverrides(v []string) (map[string]map[string]Override, error)
 				m[name] = t
 			}
 
-			o := t[kk[1]]
+			override := t[okey]
 
 			// IMPORTANT: if you add more fields here, do not forget to update
-			// docs/bake-reference.md and https://docs.docker.com/build/bake/overrides/
+			// docs/reference/buildx_bake.md (--set) and https://docs.docker.com/build/bake/overrides/
 			switch keys[1] {
-			case "output", "cache-to", "cache-from", "tags", "platform", "secrets", "ssh", "attest", "entitlements", "network":
+			case "output", "cache-to", "cache-from", "tags", "platform", "secrets", "ssh", "attest", "entitlements", "network", "annotations", "policy":
 				if len(parts) == 2 {
-					o.ArrValue = append(o.ArrValue, parts[1])
+					override.Append = appendTo
+					override.ArrValue = append(override.ArrValue, parts[1])
 				}
 			case "args":
 				if len(keys) != 3 {
 					return nil, errors.Errorf("invalid key %s, args requires name", parts[0])
 				}
-				if len(parts) < 2 {
+				if len(parts) < 2 && envLookupAllowed() {
 					v, ok := os.LookupEnv(keys[2])
 					if !ok {
 						continue
 					}
-					o.Value = v
+					override.Value = v
 				}
 				fallthrough
 			case "contexts":
@@ -581,11 +625,11 @@ func (c Config) newOverrides(v []string) (map[string]map[string]Override, error)
 				fallthrough
 			default:
 				if len(parts) == 2 {
-					o.Value = parts[1]
+					override.Value = parts[1]
 				}
 			}
 
-			t[kk[1]] = o
+			t[okey] = override
 		}
 	}
 	return m, nil
@@ -643,7 +687,7 @@ func (c Config) ResolveTarget(name string, overrides map[string]map[string]Overr
 		s := "."
 		t.Context = &s
 	}
-	if t.Dockerfile == nil {
+	if t.Dockerfile == nil || (t.Dockerfile != nil && *t.Dockerfile == "") {
 		s := "Dockerfile"
 		t.Dockerfile = &s
 	}
@@ -701,34 +745,79 @@ type Target struct {
 	// Inherits is the only field that cannot be overridden with --set
 	Inherits []string `json:"inherits,omitempty" hcl:"inherits,optional" cty:"inherits"`
 
-	Annotations      []string                `json:"annotations,omitempty" hcl:"annotations,optional" cty:"annotations"`
-	Attest           buildflags.Attests      `json:"attest,omitempty" hcl:"attest,optional" cty:"attest"`
-	Context          *string                 `json:"context,omitempty" hcl:"context,optional" cty:"context"`
-	Contexts         map[string]string       `json:"contexts,omitempty" hcl:"contexts,optional" cty:"contexts"`
-	Dockerfile       *string                 `json:"dockerfile,omitempty" hcl:"dockerfile,optional" cty:"dockerfile"`
-	DockerfileInline *string                 `json:"dockerfile-inline,omitempty" hcl:"dockerfile-inline,optional" cty:"dockerfile-inline"`
-	Args             map[string]*string      `json:"args,omitempty" hcl:"args,optional" cty:"args"`
-	Labels           map[string]*string      `json:"labels,omitempty" hcl:"labels,optional" cty:"labels"`
-	Tags             []string                `json:"tags,omitempty" hcl:"tags,optional" cty:"tags"`
-	CacheFrom        buildflags.CacheOptions `json:"cache-from,omitempty" hcl:"cache-from,optional" cty:"cache-from"`
-	CacheTo          buildflags.CacheOptions `json:"cache-to,omitempty" hcl:"cache-to,optional" cty:"cache-to"`
-	Target           *string                 `json:"target,omitempty" hcl:"target,optional" cty:"target"`
-	Secrets          buildflags.Secrets      `json:"secret,omitempty" hcl:"secret,optional" cty:"secret"`
-	SSH              buildflags.SSHKeys      `json:"ssh,omitempty" hcl:"ssh,optional" cty:"ssh"`
-	Platforms        []string                `json:"platforms,omitempty" hcl:"platforms,optional" cty:"platforms"`
-	Outputs          buildflags.Exports      `json:"output,omitempty" hcl:"output,optional" cty:"output"`
-	Pull             *bool                   `json:"pull,omitempty" hcl:"pull,optional" cty:"pull"`
-	NoCache          *bool                   `json:"no-cache,omitempty" hcl:"no-cache,optional" cty:"no-cache"`
-	NetworkMode      *string                 `json:"network,omitempty" hcl:"network,optional" cty:"network"`
-	NoCacheFilter    []string                `json:"no-cache-filter,omitempty" hcl:"no-cache-filter,optional" cty:"no-cache-filter"`
-	ShmSize          *string                 `json:"shm-size,omitempty" hcl:"shm-size,optional" cty:"shm-size"`
-	Ulimits          []string                `json:"ulimits,omitempty" hcl:"ulimits,optional" cty:"ulimits"`
-	Call             *string                 `json:"call,omitempty" hcl:"call,optional" cty:"call"`
-	Entitlements     []string                `json:"entitlements,omitempty" hcl:"entitlements,optional" cty:"entitlements"`
+	Annotations      []string                 `json:"annotations,omitempty" hcl:"annotations,optional" cty:"annotations"`
+	Attest           buildflags.Attests       `json:"attest,omitempty" hcl:"attest,optional" cty:"attest"`
+	Context          *string                  `json:"context,omitempty" hcl:"context,optional" cty:"context"`
+	Contexts         map[string]string        `json:"contexts,omitempty" hcl:"contexts,optional" cty:"contexts"`
+	Dockerfile       *string                  `json:"dockerfile,omitempty" hcl:"dockerfile,optional" cty:"dockerfile"`
+	DockerfileInline *string                  `json:"dockerfile-inline,omitempty" hcl:"dockerfile-inline,optional" cty:"dockerfile-inline"`
+	Args             map[string]*string       `json:"args,omitempty" hcl:"args,optional" cty:"args"`
+	Labels           map[string]*string       `json:"labels,omitempty" hcl:"labels,optional" cty:"labels"`
+	Tags             []string                 `json:"tags,omitempty" hcl:"tags,optional" cty:"tags"`
+	CacheFrom        buildflags.CacheOptions  `json:"cache-from,omitempty" hcl:"cache-from,optional" cty:"cache-from"`
+	CacheTo          buildflags.CacheOptions  `json:"cache-to,omitempty" hcl:"cache-to,optional" cty:"cache-to"`
+	Target           *string                  `json:"target,omitempty" hcl:"target,optional" cty:"target"`
+	Secrets          buildflags.Secrets       `json:"secret,omitempty" hcl:"secret,optional" cty:"secret"`
+	SSH              buildflags.SSHKeys       `json:"ssh,omitempty" hcl:"ssh,optional" cty:"ssh"`
+	Platforms        []string                 `json:"platforms,omitempty" hcl:"platforms,optional" cty:"platforms"`
+	Outputs          buildflags.Exports       `json:"output,omitempty" hcl:"output,optional" cty:"output"`
+	Pull             *bool                    `json:"pull,omitempty" hcl:"pull,optional" cty:"pull"`
+	NoCache          *bool                    `json:"no-cache,omitempty" hcl:"no-cache,optional" cty:"no-cache"`
+	NetworkMode      *string                  `json:"network,omitempty" hcl:"network,optional" cty:"network"`
+	NoCacheFilter    []string                 `json:"no-cache-filter,omitempty" hcl:"no-cache-filter,optional" cty:"no-cache-filter"`
+	ShmSize          *string                  `json:"shm-size,omitempty" hcl:"shm-size,optional" cty:"shm-size"`
+	Ulimits          []string                 `json:"ulimits,omitempty" hcl:"ulimits,optional" cty:"ulimits"`
+	Call             *string                  `json:"call,omitempty" hcl:"call,optional" cty:"call"`
+	Entitlements     []string                 `json:"entitlements,omitempty" hcl:"entitlements,optional" cty:"entitlements"`
+	ExtraHosts       map[string]*string       `json:"extra-hosts,omitempty" hcl:"extra-hosts,optional" cty:"extra-hosts"`
+	Policy           buildflags.PolicyConfigs `json:"policy,omitempty" hcl:"policy,optional" cty:"policy"`
 	// IMPORTANT: if you add more fields here, do not forget to update newOverrides/AddOverrides and docs/bake-reference.md.
 
 	// linked is a private field to mark a target used as a linked one
 	linked bool
+}
+
+func (t *Target) MarshalJSON() ([]byte, error) {
+	tgt := *t
+	esc := func(s string) string {
+		return strings.ReplaceAll(strings.ReplaceAll(s, "${", "$${"), "%{", "%%{")
+	}
+
+	tgt.Annotations = slices.Clone(t.Annotations)
+	for i, v := range tgt.Annotations {
+		tgt.Annotations[i] = esc(v)
+	}
+
+	if tgt.DockerfileInline != nil {
+		escaped := esc(*tgt.DockerfileInline)
+		tgt.DockerfileInline = &escaped
+	}
+
+	tgt.Labels = maps.Clone(t.Labels)
+	for k, v := range t.Labels {
+		if v != nil {
+			escaped := esc(*v)
+			tgt.Labels[k] = &escaped
+		}
+	}
+
+	tgt.Args = maps.Clone(t.Args)
+	for k, v := range t.Args {
+		if v != nil {
+			escaped := esc(*v)
+			tgt.Args[k] = &escaped
+		}
+	}
+
+	tgt.ExtraHosts = maps.Clone(t.ExtraHosts)
+	for k, v := range t.ExtraHosts {
+		if v != nil {
+			escaped := esc(*v)
+			tgt.ExtraHosts[k] = &escaped
+		}
+	}
+
+	return json.Marshal(tgt)
 }
 
 var (
@@ -816,6 +905,9 @@ func (t *Target) Merge(t2 *Target) {
 	if t2.Attest != nil { // merge
 		t.Attest = t.Attest.Merge(t2.Attest)
 	}
+	if t2.Policy != nil { // merge
+		t.Policy = append(t.Policy, t2.Policy...)
+	}
 	if t2.Secrets != nil { // merge
 		t.Secrets = t.Secrets.Merge(t2.Secrets)
 	}
@@ -858,6 +950,15 @@ func (t *Target) Merge(t2 *Target) {
 	if t2.Entitlements != nil { // merge
 		t.Entitlements = append(t.Entitlements, t2.Entitlements...)
 	}
+	for k, v := range t2.ExtraHosts {
+		if v == nil {
+			continue
+		}
+		if t.ExtraHosts == nil {
+			t.ExtraHosts = map[string]*string{}
+		}
+		t.ExtraHosts[k] = v
+	}
 	t.Inherits = append(t.Inherits, t2.Inherits...)
 }
 
@@ -897,13 +998,32 @@ func (t *Target) AddOverrides(overrides map[string]Override, ent *EntitlementCon
 			}
 			t.Labels[keys[1]] = &value
 		case "tags":
-			t.Tags = o.ArrValue
+			if o.Append {
+				t.Tags = append(t.Tags, o.ArrValue...)
+			} else {
+				t.Tags = o.ArrValue
+			}
+		case "policy":
+			if !o.Append {
+				t.Policy = nil
+			}
+			for _, v := range o.ArrValue {
+				cfg, err := buildflags.ParsePolicyConfig(v)
+				if err != nil {
+					return err
+				}
+				t.Policy = append(t.Policy, cfg)
+			}
 		case "cache-from":
 			cacheFrom, err := buildflags.ParseCacheEntry(o.ArrValue)
 			if err != nil {
 				return err
 			}
-			t.CacheFrom = cacheFrom
+			if o.Append {
+				t.CacheFrom = t.CacheFrom.Merge(cacheFrom)
+			} else {
+				t.CacheFrom = cacheFrom
+			}
 			for _, c := range t.CacheFrom {
 				if c.Type == "local" {
 					if v, ok := c.Attrs["src"]; ok {
@@ -916,7 +1036,11 @@ func (t *Target) AddOverrides(overrides map[string]Override, ent *EntitlementCon
 			if err != nil {
 				return err
 			}
-			t.CacheTo = cacheTo
+			if o.Append {
+				t.CacheTo = t.CacheTo.Merge(cacheTo)
+			} else {
+				t.CacheTo = cacheTo
+			}
 			for _, c := range t.CacheTo {
 				if c.Type == "local" {
 					if v, ok := c.Attrs["dest"]; ok {
@@ -933,7 +1057,11 @@ func (t *Target) AddOverrides(overrides map[string]Override, ent *EntitlementCon
 			if err != nil {
 				return errors.Wrap(err, "invalid value for outputs")
 			}
-			t.Secrets = secrets
+			if o.Append {
+				t.Secrets = t.Secrets.Merge(secrets)
+			} else {
+				t.Secrets = secrets
+			}
 			for _, s := range t.Secrets {
 				if s.FilePath != "" {
 					ent.FSRead = append(ent.FSRead, s.FilePath)
@@ -944,18 +1072,30 @@ func (t *Target) AddOverrides(overrides map[string]Override, ent *EntitlementCon
 			if err != nil {
 				return errors.Wrap(err, "invalid value for outputs")
 			}
-			t.SSH = ssh
+			if o.Append {
+				t.SSH = t.SSH.Merge(ssh)
+			} else {
+				t.SSH = ssh
+			}
 			for _, s := range t.SSH {
 				ent.FSRead = append(ent.FSRead, s.Paths...)
 			}
 		case "platform":
-			t.Platforms = o.ArrValue
+			if o.Append {
+				t.Platforms = append(t.Platforms, o.ArrValue...)
+			} else {
+				t.Platforms = o.ArrValue
+			}
 		case "output":
 			outputs, err := parseArrValue[buildflags.ExportEntry](o.ArrValue)
 			if err != nil {
 				return errors.Wrap(err, "invalid value for outputs")
 			}
-			t.Outputs = outputs
+			if o.Append {
+				t.Outputs = t.Outputs.Merge(outputs)
+			} else {
+				t.Outputs = outputs
+			}
 			for _, o := range t.Outputs {
 				if o.Destination != "" {
 					ent.FSWrite = append(ent.FSWrite, o.Destination)
@@ -985,11 +1125,19 @@ func (t *Target) AddOverrides(overrides map[string]Override, ent *EntitlementCon
 			}
 			t.NoCache = &noCache
 		case "no-cache-filter":
-			t.NoCacheFilter = o.ArrValue
+			if o.Append {
+				t.NoCacheFilter = append(t.NoCacheFilter, o.ArrValue...)
+			} else {
+				t.NoCacheFilter = o.ArrValue
+			}
 		case "shm-size":
 			t.ShmSize = &value
 		case "ulimits":
-			t.Ulimits = o.ArrValue
+			if o.Append {
+				t.Ulimits = append(t.Ulimits, o.ArrValue...)
+			} else {
+				t.Ulimits = o.ArrValue
+			}
 		case "network":
 			t.NetworkMode = &value
 		case "pull":
@@ -1010,6 +1158,14 @@ func (t *Target) AddOverrides(overrides map[string]Override, ent *EntitlementCon
 				return errors.Errorf("invalid value %s for boolean key load", value)
 			}
 			t.Outputs = setLoadOverride(t.Outputs, load)
+		case "extra-hosts":
+			if len(keys) != 2 {
+				return errors.Errorf("invalid format for extra-hosts, expecting extra-hosts.<hostname>=<ip>")
+			}
+			if t.ExtraHosts == nil {
+				t.ExtraHosts = map[string]*string{}
+			}
+			t.ExtraHosts[keys[1]] = &value
 		default:
 			return errors.Errorf("unknown key: %s", keys[0])
 		}
@@ -1067,9 +1223,7 @@ func (t *Target) GetEvalContexts(ectx *hcl.EvalContext, block *hcl.Block, loadDe
 				e2 := ectx.NewChild()
 				e2.Variables = make(map[string]cty.Value)
 				if e != ectx {
-					for k, v := range e.Variables {
-						e2.Variables[k] = v
-					}
+					maps.Copy(e2.Variables, e.Variables)
 				}
 				e2.Variables[k] = v
 				ectxs2 = append(ectxs2, e2)
@@ -1128,17 +1282,12 @@ func (t *Target) GetName(ectx *hcl.EvalContext, block *hcl.Block, loadDeps func(
 }
 
 func TargetsToBuildOpt(m map[string]*Target, inp *Input) (map[string]build.Options, error) {
-	// make sure local credentials are loaded multiple times for different targets
-	dockerConfig := config.LoadDefaultConfigFile(os.Stderr)
-	authProvider := authprovider.NewDockerAuthProvider(dockerConfig, nil)
-
 	m2 := make(map[string]build.Options, len(m))
 	for k, v := range m {
 		bo, err := toBuildOpt(v, inp)
 		if err != nil {
 			return nil, err
 		}
-		bo.Session = append(bo.Session, authProvider)
 		m2[k] = *bo
 	}
 	return m2, nil
@@ -1152,15 +1301,18 @@ func updateContext(t *build.Inputs, inp *Input) {
 	for k, v := range t.NamedContexts {
 		if v.Path == "." {
 			t.NamedContexts[k] = build.NamedContext{Path: inp.URL}
+			continue
 		}
 		if strings.HasPrefix(v.Path, "cwd://") || strings.HasPrefix(v.Path, "target:") || strings.HasPrefix(v.Path, "docker-image:") {
 			continue
 		}
-		if build.IsRemoteURL(v.Path) {
+		if urlutil.IsRemoteURL(v.Path) {
 			continue
 		}
-		st := llb.Scratch().File(llb.Copy(*inp.State, v.Path, "/"), llb.WithCustomNamef("set context %s to %s", k, v.Path))
-		t.NamedContexts[k] = build.NamedContext{State: &st}
+		st := llb.Scratch().File(llb.Copy(*inp.State, v.Path, "/", &llb.CopyInfo{
+			CopyDirContentsOnly: true,
+		}), llb.WithCustomNamef("set context %s to %s", k, v.Path))
+		t.NamedContexts[k] = build.NamedContext{State: &st, Path: remoteURLWithSubdir(inp.URL, v.Path)}
 	}
 
 	if t.ContextPath == "." {
@@ -1170,7 +1322,7 @@ func updateContext(t *build.Inputs, inp *Input) {
 	if strings.HasPrefix(t.ContextPath, "cwd://") {
 		return
 	}
-	if build.IsRemoteURL(t.ContextPath) {
+	if urlutil.IsRemoteURL(t.ContextPath) {
 		return
 	}
 	st := llb.Scratch().File(
@@ -1180,16 +1332,44 @@ func updateContext(t *build.Inputs, inp *Input) {
 		llb.WithCustomNamef("set context to %s", t.ContextPath),
 	)
 	t.ContextState = &st
+	t.ContextPath = remoteURLWithSubdir(inp.URL, t.ContextPath)
 }
 
-func isRemoteContext(t build.Inputs, inp *Input) bool {
-	if build.IsRemoteURL(t.ContextPath) {
-		return true
+func remoteURLWithSubdir(remoteURL, subdir string) string {
+	subdir = path.Clean(subdir)
+	if subdir == "." || remoteURL == "" {
+		return remoteURL
 	}
-	if inp != nil && build.IsRemoteURL(inp.URL) && !strings.HasPrefix(t.ContextPath, "cwd://") {
-		return true
+
+	// only relevant for git urls
+	parsed, ok, err := dfgitutil.ParseGitRef(remoteURL)
+	if err != nil || !ok {
+		return remoteURL
 	}
-	return false
+	if parsed.SubDir != "" {
+		subdir = path.Clean(path.Join(parsed.SubDir, subdir))
+	}
+
+	// keep query string and transport style untouched nad only append/adjust
+	// fragment subdir
+	if !strings.Contains(remoteURL, "#") && subdir != "" {
+		if u, err := url.Parse(remoteURL); err == nil {
+			q := u.Query()
+			if q.Has("subdir") {
+				q.Set("subdir", subdir)
+				u.RawQuery = q.Encode()
+				return u.String()
+			}
+		}
+	}
+
+	// otherwise, we adjust the fragment part to add/replace subdir
+	base, frag, _ := strings.Cut(remoteURL, "#")
+	ref, _, _ := strings.Cut(frag, ":")
+	if ref == "" {
+		return base + "#:" + subdir
+	}
+	return base + "#" + ref + ":" + subdir
 }
 
 func collectLocalPaths(t build.Inputs) []string {
@@ -1201,8 +1381,8 @@ func collectLocalPaths(t build.Inputs) []string {
 		if v, ok := isLocalPath(t.DockerfilePath); ok {
 			out = append(out, v)
 		}
-	} else if strings.HasPrefix(t.ContextPath, "cwd://") {
-		out = append(out, strings.TrimPrefix(t.ContextPath, "cwd://"))
+	} else if v, ok := strings.CutPrefix(t.ContextPath, "cwd://"); ok {
+		out = append(out, v)
 	}
 	for _, v := range t.NamedContexts {
 		if v.State != nil {
@@ -1216,7 +1396,7 @@ func collectLocalPaths(t build.Inputs) []string {
 }
 
 func isLocalPath(p string) (string, bool) {
-	if build.IsRemoteURL(p) || strings.HasPrefix(p, "target:") || strings.HasPrefix(p, "docker-image:") {
+	if urlutil.IsRemoteURL(p) || strings.HasPrefix(p, "target:") || strings.HasPrefix(p, "docker-image:") {
 		return "", false
 	}
 	return strings.TrimPrefix(p, "cwd://"), true
@@ -1234,7 +1414,7 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	if t.Context != nil {
 		contextPath = *t.Context
 	}
-	if !strings.HasPrefix(contextPath, "cwd://") && !build.IsRemoteURL(contextPath) {
+	if !strings.HasPrefix(contextPath, "cwd://") && !urlutil.IsRemoteURL(contextPath) {
 		contextPath = path.Clean(contextPath)
 	}
 	dockerfilePath := "Dockerfile"
@@ -1254,17 +1434,17 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 		bi.DockerfileInline = *t.DockerfileInline
 	}
 	updateContext(&bi, inp)
-	if strings.HasPrefix(bi.DockerfilePath, "cwd://") {
+	if v, ok := strings.CutPrefix(bi.DockerfilePath, "cwd://"); ok {
 		// If Dockerfile is local for a remote invocation, we first check if
 		// it's not outside the working directory and then resolve it to an
 		// absolute path.
-		bi.DockerfilePath = path.Clean(strings.TrimPrefix(bi.DockerfilePath, "cwd://"))
+		bi.DockerfilePath = path.Clean(v)
 		var err error
 		bi.DockerfilePath, err = filepath.Abs(bi.DockerfilePath)
 		if err != nil {
 			return nil, err
 		}
-	} else if !build.IsRemoteURL(bi.DockerfilePath) && strings.HasPrefix(bi.ContextPath, "cwd://") && (inp != nil && build.IsRemoteURL(inp.URL)) {
+	} else if !urlutil.IsRemoteURL(bi.DockerfilePath) && strings.HasPrefix(bi.ContextPath, "cwd://") && (inp != nil && urlutil.IsRemoteURL(inp.URL)) {
 		// We don't currently support reading a remote Dockerfile with a local
 		// context when doing a remote invocation because we automatically
 		// derive the dockerfile from the context atm:
@@ -1283,15 +1463,15 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 			return nil, errors.Errorf("reading a dockerfile for a remote build invocation is currently not supported")
 		}
 	}
-	if strings.HasPrefix(bi.ContextPath, "cwd://") {
-		bi.ContextPath = path.Clean(strings.TrimPrefix(bi.ContextPath, "cwd://"))
+	if v, ok := strings.CutPrefix(bi.ContextPath, "cwd://"); ok {
+		bi.ContextPath = path.Clean(v)
 	}
-	if !build.IsRemoteURL(bi.ContextPath) && bi.ContextState == nil && !path.IsAbs(bi.DockerfilePath) {
-		bi.DockerfilePath = path.Join(bi.ContextPath, bi.DockerfilePath)
+	if !urlutil.IsRemoteURL(bi.ContextPath) && bi.ContextState == nil && !filepath.IsAbs(bi.DockerfilePath) {
+		bi.DockerfilePath = filepath.Join(bi.ContextPath, bi.DockerfilePath)
 	}
 	for k, v := range bi.NamedContexts {
-		if strings.HasPrefix(v.Path, "cwd://") {
-			bi.NamedContexts[k] = build.NamedContext{Path: path.Clean(strings.TrimPrefix(v.Path, "cwd://"))}
+		if v, ok := strings.CutPrefix(v.Path, "cwd://"); ok {
+			bi.NamedContexts[k] = build.NamedContext{Path: path.Clean(v)}
 		}
 	}
 
@@ -1332,6 +1512,15 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 		}
 	}
 
+	var extraHosts []string
+	for _, k := range slices.Sorted(maps.Keys(t.ExtraHosts)) {
+		v := t.ExtraHosts[k]
+		if v == nil {
+			continue
+		}
+		extraHosts = append(extraHosts, fmt.Sprintf("%s=%s", k, *v))
+	}
+
 	bo := &build.Options{
 		Inputs:        bi,
 		Tags:          t.Tags,
@@ -1343,6 +1532,7 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 		NetworkMode:   networkMode,
 		Linked:        t.linked,
 		ShmSize:       *shmSize,
+		ExtraHosts:    extraHosts,
 	}
 
 	platforms, err := platformutil.Parse(t.Platforms)
@@ -1352,34 +1542,22 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	bo.Platforms = platforms
 
 	secrets := t.Secrets
-	if isRemoteContext(bi, inp) {
-		if _, ok := os.LookupEnv("BUILDX_BAKE_GIT_AUTH_TOKEN"); ok {
-			secrets = append(secrets, &buildflags.Secret{
-				ID:  llb.GitAuthTokenKey,
-				Env: "BUILDX_BAKE_GIT_AUTH_TOKEN",
-			})
-		}
-		if _, ok := os.LookupEnv("BUILDX_BAKE_GIT_AUTH_HEADER"); ok {
-			secrets = append(secrets, &buildflags.Secret{
-				ID:  llb.GitAuthHeaderKey,
-				Env: "BUILDX_BAKE_GIT_AUTH_HEADER",
-			})
-		}
+	if inp != nil && shouldAttachGitAuthSecrets(inp.URL, bi.ContextPath) {
+		secrets = append(secrets, gitAuthSecretsFromEnv(inp.URL)...)
 	}
-	secrets = secrets.Normalize()
-	bo.SecretSpecs = secrets.ToPB()
-	secretAttachment, err := controllerapi.CreateSecrets(bo.SecretSpecs)
+	bo.SecretSpecs = secrets.Normalize()
+	secretAttachment, err := build.CreateSecrets(bo.SecretSpecs)
 	if err != nil {
 		return nil, err
 	}
 	bo.Session = append(bo.Session, secretAttachment)
 
-	bo.SSHSpecs = t.SSH.ToPB()
+	bo.SSHSpecs = t.SSH
 	if len(bo.SSHSpecs) == 0 && buildflags.IsGitSSH(bi.ContextPath) || (inp != nil && buildflags.IsGitSSH(inp.URL)) {
-		bo.SSHSpecs = []*controllerapi.SSH{{ID: "default"}}
+		bo.SSHSpecs = []*buildflags.SSH{{ID: "default"}}
 	}
 
-	sshAttachment, err := controllerapi.CreateSSH(bo.SSHSpecs)
+	sshAttachment, err := build.CreateSSH(bo.SSHSpecs)
 	if err != nil {
 		return nil, err
 	}
@@ -1396,28 +1574,30 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	}
 
 	if t.CacheFrom != nil {
-		bo.CacheFrom = controllerapi.CreateCaches(t.CacheFrom.ToPB())
+		bo.CacheFrom = build.CreateCaches(t.CacheFrom)
 	}
 	if t.CacheTo != nil {
-		bo.CacheTo = controllerapi.CreateCaches(t.CacheTo.ToPB())
+		bo.CacheTo = build.CreateCaches(t.CacheTo)
 	}
 
-	bo.Exports, bo.ExportsLocalPathsTemporary, err = controllerapi.CreateExports(t.Outputs.ToPB())
+	bo.Exports, bo.ExportsLocalPathsTemporary, err = build.CreateExports(t.Outputs)
 	if err != nil {
 		return nil, err
 	}
 
-	annotations, err := buildflags.ParseAnnotations(t.Annotations)
+	bo.Annotations, err = buildflags.ParseAnnotations(t.Annotations)
 	if err != nil {
 		return nil, err
 	}
 	for _, e := range bo.Exports {
-		for k, v := range annotations {
+		for k, v := range bo.Annotations {
 			e.Attrs[k.String()] = v
 		}
 	}
 
-	bo.Attests = controllerapi.CreateAttestations(t.Attest.ToPB())
+	bo.Attests = t.Attest.ToMap()
+
+	bo.Policy = []buildflags.PolicyConfig(t.Policy)
 
 	bo.SourcePolicy, err = build.ReadSourcePolicy()
 	if err != nil {
@@ -1432,9 +1612,7 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	}
 	bo.Ulimits = ulimits
 
-	for _, ent := range t.Entitlements {
-		bo.Allow = append(bo.Allow, entitlements.Entitlement(ent))
-	}
+	bo.Allow = append(bo.Allow, t.Entitlements...)
 
 	return bo, nil
 }
@@ -1584,3 +1762,13 @@ func parseArrValue[T any, PT arrValue[T]](s []string) ([]*T, error) {
 	}
 	return outputs, nil
 }
+
+var envLookupAllowed = sync.OnceValue(func() bool {
+	if v, ok := os.LookupEnv("BUILDX_BAKE_DISABLE_VARS_ENV_LOOKUP"); ok {
+		disable, err := strconv.ParseBool(v)
+		if err == nil && disable {
+			return false
+		}
+	}
+	return true
+})

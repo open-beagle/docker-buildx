@@ -4,7 +4,6 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/containerd/platforms"
 	"github.com/docker/go-units"
@@ -17,7 +16,7 @@ import (
 
 func parsePlatforms(v string) ([]ocispecs.Platform, error) {
 	var pp []ocispecs.Platform
-	for _, v := range strings.Split(v, ",") {
+	for v := range strings.SplitSeq(v, ",") {
 		p, err := platforms.Parse(v)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to parse target platform %s", v)
@@ -113,23 +112,11 @@ func parseNetMode(v string) (pb.NetMode, error) {
 	}
 }
 
-func parseSourceDateEpoch(v string) (*time.Time, error) {
-	if v == "" {
-		return nil, nil
-	}
-	sde, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
-		return nil, errors.Wrapf(err, "invalid SOURCE_DATE_EPOCH: %s", v)
-	}
-	tm := time.Unix(sde, 0).UTC()
-	return &tm, nil
-}
-
 func parseLocalSessionIDs(opt map[string]string) map[string]string {
 	m := map[string]string{}
 	for k, v := range opt {
-		if strings.HasPrefix(k, localSessionIDPrefix) {
-			m[strings.TrimPrefix(k, localSessionIDPrefix)] = v
+		if after, ok := strings.CutPrefix(k, localSessionIDPrefix); ok {
+			m[after] = v
 		}
 	}
 	return m
@@ -138,8 +125,8 @@ func parseLocalSessionIDs(opt map[string]string) map[string]string {
 func filter(opt map[string]string, key string) map[string]string {
 	m := map[string]string{}
 	for k, v := range opt {
-		if strings.HasPrefix(k, key) {
-			m[strings.TrimPrefix(k, key)] = v
+		if after, ok := strings.CutPrefix(k, key); ok {
+			m[after] = v
 		}
 	}
 	return m

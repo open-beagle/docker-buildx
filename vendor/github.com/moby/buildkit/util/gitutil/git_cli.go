@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -26,6 +27,7 @@ type GitCLI struct {
 
 	sshAuthSock   string
 	sshKnownHosts string
+	hostGitConfig bool
 }
 
 // Option provides a variadic option for configuring the git client.
@@ -96,6 +98,15 @@ func WithSSHKnownHosts(sshKnownHosts string) Option {
 	}
 }
 
+// WithHostGitConfig allows git to read the host system and user git config.
+// This is intended for client-side local git inspection. The default remains
+// isolated so daemon-side callers do not leak host configuration into git.
+func WithHostGitConfig() Option {
+	return func(b *GitCLI) {
+		b.hostGitConfig = true
+	}
+}
+
 type StreamFunc func(context.Context) (io.WriteCloser, io.WriteCloser, func())
 
 // WithStreams configures a callback for getting the streams for a command. The
@@ -107,7 +118,7 @@ func WithStreams(streams StreamFunc) Option {
 	}
 }
 
-// New initializes a new git client
+// NewGitCLI initializes a new git client
 func NewGitCLI(opts ...Option) *GitCLI {
 	c := &GitCLI{}
 	for _, opt := range opts {
@@ -120,7 +131,7 @@ func NewGitCLI(opts ...Option) *GitCLI {
 // with the given options applied on top.
 func (cli *GitCLI) New(opts ...Option) *GitCLI {
 	clone := *cli
-	clone.args = append([]string{}, cli.args...)
+	clone.args = slices.Clone(cli.args)
 
 	for _, opt := range opts {
 		opt(&clone)
@@ -144,7 +155,7 @@ func (cli *GitCLI) Run(ctx context.Context, args ...string) (_ []byte, err error
 		if cli.exec == nil {
 			cmd = exec.CommandContext(ctx, gitBinary)
 		} else {
-			cmd = exec.Command(gitBinary)
+			cmd = exec.CommandContext(context.TODO(), gitBinary)
 		}
 
 		cmd.Dir = cli.dir
@@ -190,9 +201,28 @@ func (cli *GitCLI) Run(ctx context.Context, args ...string) (_ []byte, err error
 			"GIT_TERMINAL_PROMPT=0",
 			"GIT_SSH_COMMAND=" + getGitSSHCommand(cli.sshKnownHosts),
 			//	"GIT_TRACE=1",
-			"GIT_CONFIG_NOSYSTEM=1", // Disable reading from system gitconfig.
-			"HOME=/dev/null",        // Disable reading from user gitconfig.
-			"LC_ALL=C",              // Ensure consistent output.
+			"LC_ALL=C", // Ensure consistent output.
+		}
+		if cli.hostGitConfig {
+			for _, ev := range [...]string{
+				"HOME",
+				"XDG_CONFIG_HOME",
+				"USERPROFILE",
+				"HOMEDRIVE",
+				"HOMEPATH",
+				"GIT_CONFIG_GLOBAL",
+				"GIT_CONFIG_SYSTEM",
+			} {
+				if v, ok := os.LookupEnv(ev); ok {
+					cmd.Env = append(cmd.Env, ev+"="+v)
+				}
+			}
+		} else {
+			cmd.Env = append(cmd.Env,
+				"GIT_CONFIG_NOSYSTEM=1",         // Disable reading from system gitconfig.
+				"HOME="+os.DevNull,              // Disable reading from user gitconfig.
+				"GIT_CONFIG_GLOBAL="+os.DevNull, // Disable reading from global gitconfig.
+			)
 		}
 		for _, ev := range proxyEnvVars {
 			if v, ok := os.LookupEnv(ev); ok {
@@ -243,7 +273,7 @@ func (cli *GitCLI) Run(ctx context.Context, args ...string) (_ []byte, err error
 }
 
 func getGitSSHCommand(knownHosts string) string {
-	gitSSHCommand := "ssh -F /dev/null"
+	gitSSHCommand := "ssh -F " + os.DevNull
 	if knownHosts != "" {
 		gitSSHCommand += " -o UserKnownHostsFile=" + knownHosts
 	} else {
