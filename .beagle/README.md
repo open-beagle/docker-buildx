@@ -14,8 +14,8 @@ git -C ansible-docker-buildx merge v0.34.0
 
 ```bash
 # loong64
-docker run -it \
---rm \
+docker run -it --rm \
+-v $PWD/:/go/src/github.com/docker/ \
 -v $PWD/ansible-docker-buildx:/go/src/github.com/docker/buildx \
 -w /go/src/github.com/docker/buildx \
 -e VERSION=v0.34.0-beagle \
@@ -24,8 +24,8 @@ registry.cn-qingdao.aliyuncs.com/wod/golang:1.23-loongnix \
 bash .beagle/build.sh
 
 # amd64&arm64
-docker run -it \
---rm \
+docker run -it --rm \
+-v $PWD/:/go/src/github.com/docker/ \
 -v $PWD/ansible-docker-buildx:/go/src/github.com/docker/buildx \
 -w /go/src/github.com/docker/buildx \
 -e VERSION=v0.34.0-beagle \
@@ -39,14 +39,16 @@ bash .beagle/build.sh
 ```bash
 # amd64
 docker run -it --rm \
--v $PWD/:/go/src/github.com/docker/buildx \
+-v $PWD/:/go/src/github.com/docker/ \
+-v $PWD/ansible-docker-buildx:/go/src/github.com/docker/buildx \
 -w /go/src/github.com/docker/buildx \
 registry.cn-qingdao.aliyuncs.com/wod/alpine:3-amd64 \
 sh -c "build/docker-linux-amd64 version"
 
 # arm64
 docker run -it --rm \
--v $PWD/:/go/src/github.com/docker/buildx \
+-v $PWD/:/go/src/github.com/docker/ \
+-v $PWD/ansible-docker-buildx:/go/src/github.com/docker/buildx \
 -w /go/src/github.com/docker/buildx \
 registry.cn-qingdao.aliyuncs.com/wod/alpine:3-arm64 \
 sh -c "build/docker-linux-arm64 version"
