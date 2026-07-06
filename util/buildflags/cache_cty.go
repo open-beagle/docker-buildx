@@ -36,16 +36,6 @@ func (o *CacheOptions) fromCtyValue(in cty.Value, p cty.Path) (retErr error) {
 			return true
 		}
 
-		// Special handling for a string type to handle ref only format.
-		if value.Type() == cty.String {
-			entries, err := ParseCacheEntry([]string{value.AsString()})
-			if err != nil {
-				return err
-			}
-			*o = append(*o, entries...)
-			continue
-		}
-
 		entry := &CacheOptionsEntry{}
 		if retErr = entry.FromCtyValue(value, p); retErr != nil {
 			return false

@@ -187,12 +187,13 @@ func (o *buildOptions) toOptions() (*BuildOptions, error) {
 	if err != nil {
 		return nil, err
 	}
+	opts.CacheFrom = cacheFrom
 
-	opts.CacheTo, err = buildflags.ParseCacheEntry(o.cacheTo)
+	cacheTo, err := buildflags.ParseCacheEntry(o.cacheTo)
 	if err != nil {
 		return nil, err
 	}
-	opts.CacheTo = cacheTo.ToPB()
+	opts.CacheTo = cacheTo
 
 	opts.Secrets, err = buildflags.ParseSecretSpecs(o.secrets)
 	if err != nil {
